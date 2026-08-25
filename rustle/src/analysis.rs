@@ -4,7 +4,9 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+// rand 0.10 split the convenience methods (`random_range`) out of `Rng` — which is
+// now just the core trait re-exported from rand_core — into `RngExt`.
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -256,7 +258,7 @@ fn paired_outcomes(
                 complete_horizon(&control, trades, cfg)
             })
             .collect();
-        if let Some(t) = (!pool.is_empty()).then(|| pool[rng.gen_range(0..pool.len())]) {
+        if let Some(t) = (!pool.is_empty()).then(|| pool[rng.random_range(0..pool.len())]) {
             let mut control = signal.clone();
             control.meta.exchange_ts = t.meta.exchange_ts;
             control.meta.receive_ts = t.meta.receive_ts;
@@ -278,7 +280,7 @@ fn confidence_interval(hits: &[bool], controls: &[bool], cfg: &Config, label: &s
         let mut signal_hits = 0usize;
         let mut random_hits = 0usize;
         for _ in 0..n {
-            let i = rng.gen_range(0..n); // paired resampling preserves each signal/control pair
+            let i = rng.random_range(0..n); // paired resampling preserves each signal/control pair
             signal_hits += hits[i] as usize;
             random_hits += controls[i] as usize;
         }
