@@ -442,7 +442,7 @@ pub fn paper(
 ) -> Vec<crate::model::PaperTrade> {
     signals
         .iter()
-        .filter(|s| passed.contains(&s.rule_id))
+        .filter(|s| passed.contains(&format!("{}:{}", s.signal_type, s.rule_id)))
         .filter_map(|s| {
             let e = trades.iter().find(|t| {
                 t.meta.market == s.meta.market && t.meta.exchange_ts >= s.meta.exchange_ts

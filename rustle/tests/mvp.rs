@@ -119,8 +119,28 @@ fn paper_exit_is_first_trade_at_or_after_fifteen_minutes() {
             sequential_id: None,
         },
     ];
-    let p = analysis::paper(&[signal], &tr, &["ok".into()], &cfg);
+    let p = analysis::paper(&[signal], &tr, &["x:ok".into()], &cfg);
     assert_eq!(p[0].exit_price, 110.);
+}
+
+#[test]
+fn paper_only_uses_the_validation_qualified_signal_type_and_rule() {
+    let cfg = Config::default();
+    let mut qualified = candidate(0, 0, "shared");
+    qualified.signal_type = "qualified".into();
+    let mut unqualified = qualified.clone();
+    unqualified.signal_type = "unqualified".into();
+    let trades = vec![dated_trade(0, 0, 100.0), dated_trade(0, 15, 101.0)];
+
+    let paper = analysis::paper(
+        &[qualified, unqualified],
+        &trades,
+        &["qualified:shared".into()],
+        &cfg,
+    );
+
+    assert_eq!(paper.len(), 1);
+    assert_eq!(paper[0].signal.signal_type, "qualified");
 }
 
 fn dated_meta(day: i64, minute: i64) -> Meta {
