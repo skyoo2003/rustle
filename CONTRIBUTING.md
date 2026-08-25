@@ -4,10 +4,14 @@ Thanks for looking. Read this first — the project's stage changes what's usefu
 
 ## Project stage
 
-Rustle is **pre-validation**. Whether the signals it detects have any predictive power at all is an
-open question, and answering it is the current work. Until that's settled, contributions that add
-surface area (new exchanges, new signal families, UI, live order submission) are unlikely to be
-merged — not because they're bad, but because they'd be built on an unproven premise.
+The end goal is an **automated real-time trading system** on Upbit — live streams in, orders out, no
+human in the loop. The [roadmap in README.md](README.md#roadmap) lays out the five phases.
+
+Rustle is at phase 3: **pre-validation**. Whether the signals it detects have any predictive power at
+all is an open question, and answering it is the current work. Until that's settled, contributions
+that add surface area (new exchanges, new signal families, UI, live order submission) are unlikely to
+be merged — not because they're off-goal, but because they'd be built on an unproven premise and
+would have to be rewritten when the signal definitions change.
 
 Most useful right now:
 
@@ -17,9 +21,11 @@ Most useful right now:
 
 ## Ground rules
 
-- This is a research tool. It holds no credentials and submits no orders. **Pull requests that add
-  order submission, credential handling, or anything that turns output into a recommendation will be
-  closed.** See the disclaimer in [README.md](README.md).
+- Execution is the goal, but it is sequenced. Today the codebase holds no credentials and submits no
+  orders. **Pull requests that add order submission, credential handling, or anything that turns
+  output into a recommendation will be closed until phase 3 clears** — then that work gets designed
+  deliberately, with risk limits and a kill switch, not bolted on. See the disclaimer in
+  [README.md](README.md).
 - Don't weaken the evaluation gates (28 contiguous UTC days, days 1–14 selection / 15–28 validation,
   minimum 50 validation signals, wholly-positive bootstrap CI) to make a rule pass. Loosening a gate
   is a design change that needs its own discussion, not a line in a feature PR.
@@ -60,8 +66,9 @@ not a guideline.
   assertions on the property that matters.
 - Explain *why* in the PR description, not just what. See
   [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
-- Reversing a stated design decision — explainable rules before ML, no credentials, no order
-  submission — needs its own issue and explicit agreement first, not a quiet code change.
+- Reversing a stated design decision — explainable rules before ML, no credentials or order
+  submission before validation — needs its own issue and explicit agreement first, not a quiet code
+  change.
 
 ## Expectations
 
