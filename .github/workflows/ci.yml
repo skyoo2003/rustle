@@ -19,7 +19,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -35,7 +35,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: beta
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup toolchain install beta --profile minimal --component clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
@@ -47,17 +47,18 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Reports line coverage. There is no --fail-under floor yet: the floor should
-  # come from this job's first real measurement, not from a guess.
+  # Floor is set just under the first measured value (50.76% lines) so it blocks
+  # regression without pretending the current number is a target. Raise it when
+  # coverage genuinely improves. Worst gaps today: main.rs 0%, upbit.rs 29%.
   coverage:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show && rustup component add llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      - run: cargo llvm-cov --workspace --summary-only
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 50
