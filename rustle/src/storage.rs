@@ -86,6 +86,26 @@ pub fn clear_dataset(root: &Path, dataset: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Alert delivery is intentionally dependency-free and append-only.  Unlike
+/// Parquet batches this makes each emitted alert immediately tail-able.
+pub fn append_jsonl<T: Serialize>(
+    root: &Path,
+    dataset: &str,
+    ts: DateTime<Utc>,
+    record: &T,
+) -> Result<PathBuf> {
+    let dir = root.join(dataset).join(format!("date={}", ts.format("%F")));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("events.jsonl");
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{}", serde_json::to_string(record)?)?;
+    Ok(path)
+}
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for e in fs::read_dir(dir)? {
         let p = e?.path();

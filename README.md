@@ -8,8 +8,8 @@
 
 Project page: <https://skyoo2003.github.io/rustle/>
 
-**Goal: an automated real-time trading system for Upbit** — one that reads the order book as it
-moves, decides on its own, and executes without a human in the loop.
+**Goal: a rigorously validated public-data signal study for Upbit.** Rustle records the order book
+as it moves and tests whether explainable signals earn the right to be alerted on or paper traded.
 
 Getting there honestly means earning the right to trade first. So Rustle is built bottom-up: today
 it is a local, **public-data-only** CLI that records Upbit `trade` and `orderbook` streams, detects
@@ -23,8 +23,8 @@ is the destination; a signal that survives out-of-sample validation is the ticke
 | 1. Collect | Continuous, gap-tolerant capture of public Upbit streams to Parquet | Working |
 | 2. Detect | Explainable microstructure rules, each carrying its own evidence | Working |
 | 3. Validate | Out-of-sample proof that a rule beats a random baseline | **Current — kill gate** |
-| 4. Execute (paper) | Real-time decision loop on live streams, simulated fills | Partial (`paper` runs offline) |
-| 5. Execute (live) | Credentialed order submission, position and risk limits, kill switch | Not started, gated on phase 3 |
+| 4. Alert and paper | Qualified live alerts and simulated fills | Gated on phase 3 |
+| 5. Live execution | Credentialed order submission | Out of scope |
 
 Phases 4 and 5 do not open until phase 3 passes. That ordering is the design, not caution for its
 own sake: an automated trader built on an unvalidated signal is an expensive way to pay fees.
@@ -60,17 +60,20 @@ Parquet files are partitioned as `data/<dataset>/date=YYYY-MM-DD/market=KRW-X/`.
 a schema version, exchange/receive timestamps, and market. Keep raw `trades` and `orderbooks`: they are
 the source for retrospective rule changes.
 
-`report` deterministically regenerates candidates from raw data, requires 28 consecutive UTC collection
-dates, uses days 1–14 for selection and days 15–28 exclusively for validation, and only passes a rule
-when it has at least 50 validation signals and a wholly-positive paired-bootstrap CI. `analyze` replaces
-its derived signal files and saves an evaluation audit snapshot under `evaluation_results`.
+The MVP procedure is a hard gate:
+
+1. Collect continuously for 28 consecutive UTC dates. Raw `trades` and `orderbooks` are never replaced; sequence anomalies and connection gaps are recorded separately.
+2. Run `analyze`. It deterministically regenerates candidate signals and 15-minute outcomes from raw data, uses days 1–14 to tune one rule per signal type, and leaves days 15–28 untouched for validation.
+3. A rule passes only with the minimum validation sample and a wholly positive paired-bootstrap CI. Passing rules are persisted as the versioned active ruleset.
+4. Only then use `collect --emit-alerts` and `paper`. Alerts are console plus `data/alerts/.../events.jsonl`; paper output replaces prior derived trades and includes fees, slippage, win rate, cumulative net P&L, and HODL comparison.
+
+If no rule passes, alerting and paper trading remain blocked: revise the rules or stop the project. `analyze` replaces its derived `signals`, `signal_outcomes`, evaluation, and active-ruleset files so reruns cannot accumulate stale results.
 
 ## Status
 
-Phase 3 of 5 — pre-validation, at the kill gate. If detected signals show no edge over a random
+Phase 3 of 4 — pre-validation, at the kill gate. If detected signals show no edge over a random
 baseline, the signal definitions change or the project stops. Nothing downstream of that gate —
-alerting, paper P&L interpretation, the live trading loop the project is aimed at — means anything
-until it passes.
+alerting or paper P&L interpretation — means anything until it passes.
 
 ## Contributing
 
