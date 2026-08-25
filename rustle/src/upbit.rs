@@ -125,7 +125,8 @@ pub async fn connect(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 > {
     let (mut ws, _) = connect_async(WS_URL).await?;
-    ws.send(Message::Text(subscription(markets))).await?;
+    // tungstenite 0.26+ carries text frames as `Utf8Bytes` rather than `String`.
+    ws.send(Message::Text(subscription(markets).into())).await?;
     Ok(ws)
 }
 pub async fn next(
