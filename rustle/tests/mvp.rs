@@ -102,13 +102,297 @@ fn streaming_detector_emits_a_snapshot_bearing_signal_when_an_orderbook_arrives(
         levels: vec![],
     };
 
-    let signals = detector.on_orderbook(book);
+    let signals = detector.on_orderbook(&book);
 
     assert!(signals.iter().any(|signal| {
         signal.signal_type == "orderbook_imbalance"
             && signal.meta.exchange_ts.timestamp_millis() == 1_000
             && signal.market_snapshot["market"] == "KRW-TEST"
     }));
+}
+
+#[test]
+fn detector_uses_the_larger_ask_wall() {
+    let cfg = Config {
+        wall_min_krw: 100.,
+        ..Default::default()
+    };
+    let mut detector = SignalDetector::new(&cfg);
+    let high_ask = Orderbook {
+        meta: meta(1_000),
+        total_ask_size: 10.,
+        total_bid_size: 10.,
+        levels: vec![Level {
+            bid_price: 10.,
+            bid_size: 10.,
+            ask_price: 20.,
+            ask_size: 10.,
+        }],
+    };
+    let low = Orderbook {
+        meta: meta(2_000),
+        total_ask_size: 1.,
+        total_bid_size: 1.,
+        levels: vec![Level {
+            bid_price: 10.,
+            bid_size: 1.,
+            ask_price: 20.,
+            ask_size: 1.,
+        }],
+    };
+
+    detector.on_orderbook(&high_ask);
+    let signals = detector.on_orderbook(&low);
+
+    let wall = signals
+        .iter()
+        .find(|signal| signal.signal_type == "wall_disappearance")
+        .unwrap();
+    assert_eq!(wall.direction, Side::Sell);
+    assert_eq!(wall.baseline, 200.);
+}
+
+#[test]
+fn empty_orderbook_resets_wall_without_emitting_a_disappearance() {
+    let cfg = Config {
+        wall_min_krw: 100.,
+        ..Default::default()
+    };
+    let mut detector = SignalDetector::new(&cfg);
+    let wall = Orderbook {
+        meta: meta(1_000),
+        total_ask_size: 10.,
+        total_bid_size: 10.,
+        levels: vec![Level {
+            bid_price: 10.,
+            bid_size: 20.,
+            ask_price: 11.,
+            ask_size: 1.,
+        }],
+    };
+    let empty = Orderbook {
+        meta: meta(2_000),
+        total_ask_size: 0.,
+        total_bid_size: 0.,
+        levels: vec![],
+    };
+    let low = Orderbook {
+        meta: meta(3_000),
+        total_ask_size: 1.,
+        total_bid_size: 1.,
+        levels: vec![Level {
+            bid_price: 10.,
+            bid_size: 1.,
+            ask_price: 11.,
+            ask_size: 1.,
+        }],
+    };
+
+    detector.on_orderbook(&wall);
+    assert!(detector.on_orderbook(&empty).is_empty());
+    assert!(detector.on_orderbook(&low).is_empty());
+}
+
+#[test]
+fn threshold_signals_fire_on_crossing_and_rearm_after_reset() {
+    let cfg = Config::default();
+    let mut detector = SignalDetector::new(&cfg);
+    let high = Orderbook {
+        meta: meta(1_000),
+        total_ask_size: 1.,
+        total_bid_size: 9.,
+        levels: vec![],
+    };
+    let still_high = Orderbook {
+        meta: meta(2_000),
+        ..high.clone()
+    };
+    let neutral = Orderbook {
+        meta: meta(3_000),
+        total_ask_size: 5.,
+        total_bid_size: 5.,
+        levels: vec![],
+    };
+    let high_again = Orderbook {
+        meta: meta(4_000),
+        ..high.clone()
+    };
+
+    assert_eq!(detector.on_orderbook(&high).len(), 2);
+    assert!(detector.on_orderbook(&still_high).is_empty());
+    assert!(detector.on_orderbook(&neutral).is_empty());
+    assert_eq!(detector.on_orderbook(&high_again).len(), 2);
+}
+
+#[test]
+fn trade_baseline_evicts_expired_notionals_and_rearms_signal() {
+    let cfg = Config {
+        trade_rate_window_seconds: 10,
+        candidate: rustle::config::CandidateConfig {
+            imbalance_thresholds: vec![],
+            large_trade_multiples: vec![3.],
+            trade_rate_multiples: vec![],
+        },
+        ..Default::default()
+    };
+    let mut detector = SignalDetector::new(&cfg);
+    let trade = |second: i64, value: f64| Trade {
+        meta: meta(second * 1_000),
+        price: value,
+        volume: 1.,
+        side: Side::Buy,
+        sequential_id: None,
+    };
+
+    for second in 0..5 {
+        detector.on_trade(&trade(second, 10.));
+    }
+    let first = detector.on_trade(&trade(5, 40.));
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].baseline, 10.);
+    detector.on_trade(&trade(20, 100.));
+    for second in 21..25 {
+        detector.on_trade(&trade(second, 100.));
+    }
+    let second = detector.on_trade(&trade(25, 400.));
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].baseline, 100.);
+}
+
+#[test]
+fn streaming_trade_signal_has_a_snapshot_and_is_suppressed_until_reset() {
+    let cfg = Config {
+        candidate: rustle::config::CandidateConfig {
+            imbalance_thresholds: vec![],
+            large_trade_multiples: vec![3.],
+            trade_rate_multiples: vec![],
+        },
+        ..Default::default()
+    };
+    let mut detector = SignalDetector::new(&cfg);
+    let trade = |second: i64, value: f64| Trade {
+        meta: meta(second * 1_000),
+        price: value,
+        volume: 1.,
+        side: Side::Buy,
+        sequential_id: None,
+    };
+    for second in 0..5 {
+        detector.on_trade(&trade(second, 10.));
+    }
+
+    let first = detector.on_trade(&trade(5, 40.));
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].market_snapshot["market"], "KRW-TEST");
+    assert_eq!(first[0].meta.exchange_ts.timestamp_millis(), 5_000);
+    assert!(detector.on_trade(&trade(6, 50.)).is_empty());
+    assert!(detector.on_trade(&trade(7, 10.)).is_empty());
+    assert_eq!(detector.on_trade(&trade(8, 100.)).len(), 1);
+}
+
+#[test]
+fn trade_rate_signal_fires_on_crossing_and_rearms_after_eviction() {
+    let cfg = Config {
+        candidate: rustle::config::CandidateConfig {
+            imbalance_thresholds: vec![],
+            large_trade_multiples: vec![],
+            trade_rate_multiples: vec![0.5],
+        },
+        ..Default::default()
+    };
+    let mut detector = SignalDetector::new(&cfg);
+    let trade = |second: i64| Trade {
+        meta: meta(second * 1_000),
+        price: 10.,
+        volume: 1.,
+        side: Side::Buy,
+        sequential_id: None,
+    };
+    for second in 0..5 {
+        assert!(detector.on_trade(&trade(second)).is_empty());
+    }
+    assert_eq!(detector.on_trade(&trade(5)).len(), 1);
+    assert!(detector.on_trade(&trade(6)).is_empty());
+    assert!(detector.on_trade(&trade(70)).is_empty());
+    for second in 71..75 {
+        assert!(detector.on_trade(&trade(second)).is_empty());
+    }
+    assert_eq!(detector.on_trade(&trade(75)).len(), 1);
+}
+
+#[test]
+fn retain_markets_drops_removed_market_state() {
+    let cfg = Config {
+        wall_min_krw: 100.,
+        ..Default::default()
+    };
+    let mut detector = SignalDetector::new(&cfg);
+    let wall = Orderbook {
+        meta: meta(1_000),
+        total_ask_size: 10.,
+        total_bid_size: 10.,
+        levels: vec![Level {
+            bid_price: 10.,
+            bid_size: 20.,
+            ask_price: 11.,
+            ask_size: 1.,
+        }],
+    };
+    detector.on_orderbook(&wall);
+    detector.retain_markets(&["KRW-OTHER".into()]);
+    let low = Orderbook {
+        meta: meta(2_000),
+        total_ask_size: 1.,
+        total_bid_size: 1.,
+        levels: vec![Level {
+            bid_price: 10.,
+            bid_size: 1.,
+            ask_price: 11.,
+            ask_size: 1.,
+        }],
+    };
+    assert!(detector.on_orderbook(&low).is_empty());
+}
+
+#[test]
+fn build_signals_is_deterministic_when_inputs_are_reordered() {
+    let cfg = Config::default();
+    let trades = vec![
+        dated_trade(0, 1, 10.),
+        dated_trade(0, 0, 10.),
+        dated_trade(0, 2, 10.),
+        dated_trade(0, 3, 10.),
+        dated_trade(0, 4, 10.),
+        dated_trade(0, 5, 100.),
+    ];
+    let books = vec![
+        Orderbook {
+            meta: dated_meta(0, 1),
+            total_ask_size: 1.,
+            total_bid_size: 9.,
+            levels: vec![],
+        },
+        Orderbook {
+            meta: dated_meta(0, 0),
+            total_ask_size: 5.,
+            total_bid_size: 5.,
+            levels: vec![],
+        },
+    ];
+    let mut reverse_trades = trades.clone();
+    let mut reverse_books = books.clone();
+    reverse_trades.reverse();
+    reverse_books.reverse();
+
+    assert_eq!(
+        serde_json::to_string(&analysis::build_signals(trades, books, &cfg)).unwrap(),
+        serde_json::to_string(&analysis::build_signals(
+            reverse_trades,
+            reverse_books,
+            &cfg
+        ))
+        .unwrap()
+    );
 }
 #[test]
 fn paper_exit_is_first_trade_at_or_after_fifteen_minutes() {

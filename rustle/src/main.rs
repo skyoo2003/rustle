@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Timelike, Utc};
+use chrono::{NaiveDate, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use rustle::{
     analysis,
@@ -9,6 +9,7 @@ use rustle::{
     upbit::{self, Incoming},
 };
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -86,6 +87,7 @@ async fn collect(cfg: &Config, once: bool) -> Result<()> {
         markets.len()
     );
     let mut delay = 1u64;
+    let mut detector = analysis::SignalDetector::new(cfg);
     loop {
         // A reconnect after the configured UTC refresh hour adopts a persisted new universe.
         let refresh_now = Utc::now();
@@ -105,6 +107,7 @@ async fn collect(cfg: &Config, once: bool) -> Result<()> {
                     markets: markets.clone(),
                 }],
             )?;
+            detector.retain_markets(&markets);
         }
         let cmeta = Meta {
             schema_version: SCHEMA_VERSION,
@@ -130,9 +133,8 @@ async fn collect(cfg: &Config, once: bool) -> Result<()> {
                 let mut ts = Vec::new();
                 let mut bs = Vec::new();
                 let mut ss = Vec::new();
-                let mut detector = analysis::SignalDetector::new(cfg);
                 loop {
-                    tokio::select! { _=tokio::signal::ctrl_c()=>{flush(&root,&mut ts,&mut bs,&mut ss)?;return Ok(())}, got=upbit::next(&mut ws)=>match got {Ok(Some(Incoming::Trade(t)))=>{ss.extend(detector.on_trade(t.clone()));ts.push(t);if ts.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}},Ok(Some(Incoming::Orderbook(b)))=>{ss.extend(detector.on_orderbook(b.clone()));bs.push(b);if bs.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}},Ok(None)=>{},Err(e)=>{flush(&root,&mut ts,&mut bs,&mut ss)?;eprintln!("connection ended: {e}");break}} }
+                    tokio::select! { _=tokio::signal::ctrl_c()=>{flush(&root,&mut ts,&mut bs,&mut ss)?;return Ok(())}, got=upbit::next(&mut ws)=>match got {Ok(Some(Incoming::Trade(t)))=>{ss.extend(detector.on_trade(&t));ts.push(t);if ts.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}},Ok(Some(Incoming::Orderbook(b)))=>{ss.extend(detector.on_orderbook(&b));bs.push(b);if bs.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}},Ok(None)=>{},Err(e)=>{flush(&root,&mut ts,&mut bs,&mut ss)?;eprintln!("connection ended: {e}");break}} }
                 }
             }
             Err(e) => eprintln!("connect failed: {e}"),
@@ -169,48 +171,52 @@ fn flush(
     books: &mut Vec<rustle::model::Orderbook>,
     signals: &mut Vec<rustle::model::Signal>,
 ) -> Result<()> {
-    use std::collections::HashMap;
-    let mut tg: HashMap<String, Vec<rustle::model::Trade>> = HashMap::new();
-    for t in trades.drain(..) {
-        tg.entry(t.meta.market.clone()).or_default().push(t)
-    }
-    for (m, x) in tg {
-        storage::write(root, "trades", &m, x[0].meta.exchange_ts, &x)?;
-    }
-    let mut bg: HashMap<String, Vec<rustle::model::Orderbook>> = HashMap::new();
-    for b in books.drain(..) {
-        bg.entry(b.meta.market.clone()).or_default().push(b)
-    }
-    for (m, x) in bg {
-        storage::write(root, "orderbooks", &m, x[0].meta.exchange_ts, &x)?;
-    }
-    let mut sg: HashMap<String, Vec<rustle::model::Signal>> = HashMap::new();
-    for signal in signals.drain(..) {
-        sg.entry(signal.meta.market.clone())
+    write_partitioned(root, "trades", trades.drain(..), |trade| &trade.meta)?;
+    write_partitioned(root, "orderbooks", books.drain(..), |book| &book.meta)?;
+    write_partitioned(root, "live_signals", signals.drain(..), |signal| {
+        &signal.meta
+    })?;
+    Ok(())
+}
+
+fn write_partitioned<T, I, F>(root: &Path, dataset: &str, records: I, meta: F) -> Result<()>
+where
+    T: serde::Serialize,
+    I: IntoIterator<Item = T>,
+    F: Fn(&T) -> &Meta,
+{
+    let mut groups: BTreeMap<(String, NaiveDate), Vec<T>> = BTreeMap::new();
+    for record in records {
+        let record_meta = meta(&record);
+        groups
+            .entry((
+                record_meta.market.clone(),
+                record_meta.exchange_ts.date_naive(),
+            ))
             .or_default()
-            .push(signal)
+            .push(record);
     }
-    for (m, x) in sg {
-        storage::write(root, "signals", &m, x[0].meta.exchange_ts, &x)?;
+    for ((market, _), records) in groups {
+        storage::write(
+            root,
+            dataset,
+            &market,
+            meta(&records[0]).exchange_ts,
+            &records,
+        )?;
     }
     Ok(())
 }
 fn analyze(cfg: &Config) -> Result<()> {
-    use std::collections::HashMap;
     let root = PathBuf::from(&cfg.data_root);
     let t = storage::read_all(&root, "trades")?;
     let b = storage::read_all(&root, "orderbooks")?;
     let s = analysis::build_signals(t.clone(), b.clone(), cfg);
     // Signals are derived artefacts. Replace them so a repeated analyze is deterministic.
     storage::clear_dataset(&root, "signals")?;
-    let mut groups: HashMap<String, Vec<rustle::model::Signal>> = HashMap::new();
-    for x in s.iter().cloned() {
-        groups.entry(x.meta.market.clone()).or_default().push(x)
-    }
-    for (m, x) in groups {
-        storage::write(&root, "signals", &m, x[0].meta.exchange_ts, &x)?;
-    }
     let audit = analysis::evaluate_with_audit(&s, &t, &b, cfg)?;
+    let signal_count = s.len();
+    write_partitioned(&root, "signals", s, |signal| &signal.meta)?;
     storage::clear_dataset(&root, "evaluation_results")?;
     storage::write(
         &root,
@@ -221,7 +227,7 @@ fn analyze(cfg: &Config) -> Result<()> {
     )?;
     println!(
         "generated {} candidate signals; selected {} rules for untouched validation",
-        s.len(),
+        signal_count,
         audit.results.len()
     );
     Ok(())
@@ -290,7 +296,6 @@ fn report(cfg: &Config, csv: bool) -> Result<()> {
     Ok(())
 }
 fn paper(cfg: &Config) -> Result<()> {
-    use std::collections::HashMap;
     let root = PathBuf::from(&cfg.data_root);
     let r = results(cfg)?;
     let ids: Vec<String> = r
@@ -312,17 +317,11 @@ fn paper(cfg: &Config) -> Result<()> {
         &ids,
         cfg,
     );
-    let mut groups: HashMap<String, Vec<rustle::model::PaperTrade>> = HashMap::new();
-    for x in p.iter().cloned() {
-        groups
-            .entry(x.signal.meta.market.clone())
-            .or_default()
-            .push(x)
-    }
-    for (m, x) in groups {
-        storage::write(&root, "paper_trades", &m, x[0].signal.meta.exchange_ts, &x)?;
-    }
-    println!("simulated {} paper trades", p.len());
+    let paper_count = p.len();
+    write_partitioned(&root, "paper_trades", p, |paper_trade| {
+        &paper_trade.signal.meta
+    })?;
+    println!("simulated {} paper trades", paper_count);
     Ok(())
 }
 
@@ -355,4 +354,63 @@ fn alert(cfg: &Config) -> Result<()> {
         eprintln!("alerts blocked: no validation-qualified rules");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+    use rustle::model::{Side, Signal, Trade, SCHEMA_VERSION};
+
+    fn meta(minutes: i64) -> Meta {
+        let exchange_ts =
+            Utc.with_ymd_and_hms(2025, 1, 1, 23, 59, 0).unwrap() + Duration::minutes(minutes);
+        Meta {
+            schema_version: SCHEMA_VERSION,
+            market: "KRW-TEST".into(),
+            exchange_ts,
+            receive_ts: exchange_ts,
+        }
+    }
+
+    #[test]
+    fn flush_keeps_live_signals_separate_and_partitions_by_utc_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trades = vec![
+            Trade {
+                meta: meta(0),
+                price: 10.,
+                volume: 1.,
+                side: Side::Buy,
+                sequential_id: None,
+            },
+            Trade {
+                meta: meta(2),
+                price: 11.,
+                volume: 1.,
+                side: Side::Buy,
+                sequential_id: None,
+            },
+        ];
+        let mut books = vec![];
+        let mut live_signals = vec![Signal {
+            meta: meta(2),
+            signal_type: "test".into(),
+            direction: Side::Buy,
+            feature_value: 1.,
+            baseline: 0.,
+            rationale: "test".into(),
+            market_snapshot: serde_json::json!({}),
+            rule_id: "test".into(),
+        }];
+
+        flush(dir.path(), &mut trades, &mut books, &mut live_signals).unwrap();
+
+        let live: Vec<Signal> = storage::read_all(dir.path(), "live_signals").unwrap();
+        let derived: Vec<Signal> = storage::read_all(dir.path(), "signals").unwrap();
+        assert_eq!(live.len(), 1);
+        assert!(derived.is_empty());
+        assert!(dir.path().join("trades/date=2025-01-01").exists());
+        assert!(dir.path().join("trades/date=2025-01-02").exists());
+    }
 }
