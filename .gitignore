@@ -12,3 +12,6 @@ rustle.toml
 
 # Local-only design notes
 /docs
+
+# Local-only TDD artifacts
+/.github/tdd
