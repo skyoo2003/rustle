@@ -9,14 +9,55 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Toolchain comes from rust-toolchain.toml, so `-D warnings` can't be broken
+  # by a new stable release landing a new lint.
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+
+  # Early warning for lints and behavior changes arriving in the next stable.
+  # Allowed to fail: it tells us to schedule work, it does not block a PR.
+  beta:
+    name: beta (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: beta
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install beta --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  # Advisories, license compatibility, and source trust over the whole tree.
+  # Config and rationale live in deny.toml.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Reports line coverage. There is no --fail-under floor yet: the floor should
+  # come from this job's first real measurement, not from a guess.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show && rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo llvm-cov --workspace --summary-only

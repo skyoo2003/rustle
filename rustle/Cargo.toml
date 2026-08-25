@@ -2,6 +2,9 @@
 name = "rustle"
 version = "0.1.0"
 edition = "2021"
+# Tracks the toolchain pinned in rust-toolchain.toml. Not a researched floor —
+# nothing has been tested against older compilers.
+rust-version = "1.98"
 description = "Local, public-data-only Upbit signal study CLI"
 license = "Apache-2.0"
 repository = "https://github.com/skyoo2003/rustle"
@@ -29,3 +32,8 @@ parquet = { version = "53", features = ["arrow"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# "You can tell why it did that" is the point of this project, so the compiler
+# enforces it rather than a paragraph in CONTRIBUTING.md.
+[lints.rust]
+unsafe_code = "forbid"

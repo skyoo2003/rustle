@@ -1,6 +1,12 @@
 # Rustle
 
+[![CI](https://github.com/skyoo2003/rustle/actions/workflows/ci.yml/badge.svg)](https://github.com/skyoo2003/rustle/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust 1.98+](https://img.shields.io/badge/rust-1.98%2B-b7410e.svg)](rust-toolchain.toml)
+
 > *rustle*: the sound of leaves. The noise the order book makes before it shows up on a candle.
+
+Project page: <https://skyoo2003.github.io/rustle/>
 
 A local, **public-data-only** CLI that records Upbit `trade` and `orderbook` streams, detects
 microstructure signals, and measures whether those signals actually predict anything.

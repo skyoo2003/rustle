@@ -1,0 +1,43 @@
+# cargo-deny: dependency advisories, license compatibility, and source trust.
+# Run locally before pushing: cargo deny check
+# The dependency tree here is large (arrow, parquet, reqwest), which is exactly
+# why this is checked mechanically rather than by reading Cargo.lock.
+
+[advisories]
+version = 2
+yanked = "deny"
+# Only flag unmaintained crates we depend on directly. Transitive ones we cannot act on:
+# e.g. `paste` (RUSTSEC-2024-0436) reaches us through `parquet` and has no safe upgrade.
+# Security vulnerabilities are still denied at any depth.
+unmaintained = "workspace"
+# Add entries here only with a comment saying why the advisory does not apply.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses plus Apache-2.0, which is what this project ships under.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Public-domain dedication (tiny-keccak).
+    "CC0-1.0",
+    # Data license on the Mozilla CA root store shipped by webpki-roots.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions bloat the binary but do not break anything: warn, don't fail.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -32,16 +32,26 @@ cargo build
 cargo test --all
 ```
 
+The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). If you use rustup, the right
+version installs itself; a Homebrew or distro `rustc` ignores the pin, so your local results may
+differ slightly from CI.
+
 Before opening a PR, run what CI runs:
 
 ```sh
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --all
+cargo deny check          # cargo install cargo-deny --locked
 ```
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same three checks on every push
-and pull request. `clippy` is `-D warnings`, so a new lint fails the build.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs those on every push and pull
+request, on Linux and macOS. `clippy` is `-D warnings`, so a new lint fails the build. Two more jobs
+run alongside: `cargo-deny` (advisories, licenses, source trust — see [`deny.toml`](deny.toml)) and a
+`beta` job that is allowed to fail and exists only to warn about the next stable release.
+
+`unsafe` is forbidden crate-wide via `[lints.rust]` in `rustle/Cargo.toml`. That is a compile error,
+not a guideline.
 
 ## Pull requests
 

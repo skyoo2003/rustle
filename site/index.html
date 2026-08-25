@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rustle — order-book microstructure signal study</title>
+<meta name="description" content="A local, public-data-only CLI that records Upbit order-book and trade streams and measures whether the signals it detects predict anything. Not investment advice.">
+<style>
+  :root { color-scheme: light dark; --fg:#1a1a1a; --bg:#fbfbf9; --dim:#5c5c57; --rule:#dcdcd4; --warn:#8a2f00; --warnbg:#fdf0e8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e8e3; --bg:#141413; --dim:#9a9a92; --rule:#33332f; --warn:#ffb08a; --warnbg:#2a1a12; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:3rem 1.25rem 5rem; background:var(--bg); color:var(--fg);
+         font:16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 46rem; margin: 0 auto; }
+  h1 { font-size:2.25rem; margin:0 0 .25rem; letter-spacing:-.02em; }
+  .tag { color:var(--dim); font-style:italic; margin:0 0 2rem; }
+  h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.09em; color:var(--dim);
+       margin:2.5rem 0 .6rem; font-weight:600; }
+  p { margin:0 0 1rem; }
+  .warn { border:1px solid var(--warn); background:var(--warnbg); color:var(--warn);
+          border-radius:6px; padding:1rem 1.1rem; margin:0 0 2.5rem; }
+  .warn strong { display:block; margin-bottom:.35rem; }
+  .warn p { margin:0; font-size:.925rem; }
+  ul { margin:0; padding-left:1.2rem; }
+  li { margin-bottom:.4rem; }
+  code { font:.875em ui-monospace, SFMono-Regular, Menlo, monospace;
+         background:color-mix(in srgb, var(--fg) 8%, transparent); padding:.12em .35em; border-radius:3px; }
+  .links { display:flex; flex-wrap:wrap; gap:.6rem; margin-top:2.5rem;
+           border-top:1px solid var(--rule); padding-top:2rem; }
+  .links a { border:1px solid var(--rule); border-radius:6px; padding:.5rem .9rem;
+             text-decoration:none; color:var(--fg); font-size:.925rem; }
+  .links a:hover { border-color:var(--fg); }
+  footer { margin-top:3rem; color:var(--dim); font-size:.85rem; }
+  footer a { color:inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Rustle</h1>
+  <p class="tag">The sound of leaves. The noise the order book makes before it shows up on a candle.</p>
+
+  <div class="warn">
+    <strong>Not investment advice.</strong>
+    <p>Rustle is a research tool. It makes no recommendations and no performance claims, and its
+    signals are unvalidated by design — measuring whether they have any predictive power at all is
+    the entire point of the project. Provided “AS IS”, without warranties of any kind.</p>
+  </div>
+
+  <h2>What it does</h2>
+  <p>Records public Upbit <code>trade</code> and <code>orderbook</code> streams to local Parquet
+  files, detects microstructure signals in them, and measures whether those signals predicted
+  anything after the fact.</p>
+
+  <h2>Method</h2>
+  <ul>
+    <li><strong>Explainable rules, not a model.</strong> Every signal carries an evidence field
+      naming what triggered it. A signal without evidence cannot be published.</li>
+    <li><strong>Selection and validation are separate.</strong> Days 1–14 pick candidate rules;
+      days 15–28 are touched only to validate them. 28 contiguous UTC days are required.</li>
+    <li><strong>A rule has to clear a bar.</strong> At least 50 validation signals and a
+      wholly-positive paired-bootstrap confidence interval.</li>
+    <li><strong>No credentials, no orders.</strong> Public market data only. Simulated fills are the
+      only “execution”, and they ignore slippage, partial fills, and fees — so paper results are an
+      upper bound, not a forecast.</li>
+  </ul>
+
+  <h2>Status</h2>
+  <p>Pre-validation, with a kill gate: if detected signals show no edge over a random baseline, the
+  signal definitions change or the project stops.</p>
+
+  <div class="links">
+    <a href="https://github.com/skyoo2003/rustle">Source</a>
+    <a href="https://github.com/skyoo2003/rustle/blob/main/CONTRIBUTING.md">Contributing</a>
+    <a href="https://github.com/skyoo2003/rustle/blob/main/LICENSE">Apache-2.0</a>
+  </div>
+
+  <footer>
+    Not affiliated with Upbit. Nothing here is a solicitation or a recommendation to trade.
+  </footer>
+</main>
+</body>
+</html>

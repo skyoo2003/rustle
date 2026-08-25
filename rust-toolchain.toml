@@ -1,0 +1,7 @@
+# Pinned so a new stable release can't turn CI red via a new clippy lint.
+# CI runs `-D warnings`; an unpinned toolchain makes that a time bomb.
+# The beta job in ci.yml overrides this with RUSTUP_TOOLCHAIN as an early warning.
+# Note: this only takes effect under rustup. A Homebrew/distro rustc ignores it.
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
