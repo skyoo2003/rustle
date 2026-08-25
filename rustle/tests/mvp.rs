@@ -89,6 +89,58 @@ fn wall_cancel_signal_has_evidence() {
         .find(|x| x.signal_type == "wall_disappearance")
         .unwrap();
     assert!(!w.rationale.is_empty() && w.market_snapshot.get("market").is_some());
+    assert_eq!(w.market_snapshot["evidence"]["source"], "orderbook");
+    assert!(w.market_snapshot["evidence"]["levels"].is_array());
+}
+
+#[test]
+fn trade_snapshot_includes_trigger_and_rolling_baseline() {
+    let cfg = Config {
+        candidate: rustle::config::CandidateConfig {
+            imbalance_thresholds: vec![],
+            large_trade_multiples: vec![3.],
+            trade_rate_multiples: vec![],
+        },
+        ..Default::default()
+    };
+    let mut detector = SignalDetector::new(&cfg);
+    for second in 0..5 {
+        detector.on_trade(&Trade {
+            meta: meta(second * 1_000),
+            price: 10.,
+            volume: 1.,
+            side: Side::Buy,
+            sequential_id: Some(second as u64),
+        });
+    }
+    let signal = detector
+        .on_trade(&Trade {
+            meta: meta(5_000),
+            price: 40.,
+            volume: 1.,
+            side: Side::Buy,
+            sequential_id: Some(5),
+        })
+        .pop()
+        .unwrap();
+    assert_eq!(signal.market_snapshot["evidence"]["source"], "trade");
+    assert_eq!(
+        signal.market_snapshot["evidence"]["rolling_notional_mean"],
+        10.0
+    );
+    assert_eq!(signal.market_snapshot["evidence"]["trigger"]["price"], 40.0);
+}
+
+#[test]
+fn outcome_marks_incomplete_horizons_without_counting_a_hit() {
+    let cfg = Config::default();
+    let signal = candidate(0, 0, "only");
+    let only_entry = vec![dated_trade(0, 0, 100.)];
+    let outcome = analysis::outcome(&signal, &only_entry, &cfg);
+    assert!(!outcome.complete);
+    assert_eq!(outcome.entry_price, Some(100.));
+    assert_eq!(outcome.horizon_price, None);
+    assert_eq!(outcome.rule_key, "synthetic:only");
 }
 
 #[test]

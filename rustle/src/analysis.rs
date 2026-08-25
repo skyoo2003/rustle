@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    model::{Meta, Orderbook, Side, Signal, Trade},
+    model::{Meta, Orderbook, Side, Signal, SignalOutcome, Trade},
 };
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -84,6 +84,12 @@ impl SignalDetector {
                         value / baseline
                     ),
                     rule,
+                    serde_json::json!({
+                        "source":"trade", "trigger": t,
+                        "rolling_trade_count": s.trades.len(),
+                        "rolling_notional_sum": s.trade_notional_sum,
+                        "rolling_notional_mean": baseline,
+                    }),
                 ));
             } else if !active {
                 s.active_rules.remove(&rule);
@@ -104,6 +110,13 @@ impl SignalDetector {
                     base,
                     format!("{} trades in rolling window", prior),
                     rule,
+                    serde_json::json!({
+                        "source":"trade", "trigger": t,
+                        "rolling_trade_count": prior,
+                        "window_seconds": self.cfg.trade_rate_window_seconds,
+                        "rolling_rate_per_second": rate,
+                        "baseline_rate_per_second": base,
+                    }),
                 ));
             } else if !active {
                 s.active_rules.remove(&rule);
@@ -133,6 +146,11 @@ impl SignalDetector {
                     0.0,
                     format!("bid/ask size imbalance {:.3}", value),
                     rule,
+                    serde_json::json!({
+                        "source":"orderbook", "total_bid_size": b.total_bid_size,
+                        "total_ask_size": b.total_ask_size, "levels": b.levels,
+                        "imbalance": value,
+                    }),
                 ));
             } else if !active {
                 s.active_rules.remove(&rule);
@@ -167,6 +185,12 @@ impl SignalDetector {
                     old,
                     format!("previous {:.0} KRW {:?} wall disappeared", old, oldside),
                     "wall-drop".into(),
+                    serde_json::json!({
+                        "source":"orderbook", "total_bid_size": b.total_bid_size,
+                        "total_ask_size": b.total_ask_size, "levels": b.levels,
+                        "previous_wall_krw": old, "previous_wall_side": oldside,
+                        "current_largest_wall_krw": wall, "current_largest_wall_side": side,
+                    }),
                 ));
             }
         }
@@ -179,6 +203,11 @@ impl SignalDetector {
         let markets: BTreeSet<&str> = markets.iter().map(String::as_str).collect();
         self.states
             .retain(|market, _| markets.contains(market.as_str()));
+    }
+
+    /// A reconnect is a discontinuity: never carry a rolling baseline across it.
+    pub fn reset(&mut self) {
+        self.states.clear();
     }
 }
 struct SelectedCandidate<'a> {
@@ -217,6 +246,7 @@ pub fn build_signals(
     }
     out
 }
+#[allow(clippy::too_many_arguments)] // inputs mirror the persisted Signal fields plus provenance
 fn signal(
     meta: Meta,
     ty: &str,
@@ -225,9 +255,10 @@ fn signal(
     baseline: f64,
     rationale: String,
     rule: String,
+    evidence: serde_json::Value,
 ) -> Signal {
     Signal {
-        market_snapshot: serde_json::json!({"market":meta.market,"exchange_ts":meta.exchange_ts,"feature":value,"baseline":baseline}),
+        market_snapshot: serde_json::json!({"market":meta.market,"exchange_ts":meta.exchange_ts,"feature":value,"baseline":baseline,"evidence":evidence}),
         meta,
         signal_type: ty.into(),
         direction,
@@ -237,33 +268,53 @@ fn signal(
         rule_id: rule,
     }
 }
-fn is_hit(s: &Signal, trades: &[Trade], cfg: &Config) -> bool {
+pub fn rule_key(signal: &Signal) -> String {
+    format!("{}:{}", signal.signal_type, signal.rule_id)
+}
+
+pub fn outcome(signal: &Signal, trades: &[Trade], cfg: &Config) -> SignalOutcome {
     let entry = trades
         .iter()
-        .find(|t| t.meta.market == s.meta.market && t.meta.exchange_ts >= s.meta.exchange_ts)
-        .map(|t| t.price);
-    let Some(entry) = entry else { return false };
-    let end = s.meta.exchange_ts + Duration::minutes(cfg.validation.horizon_minutes);
-    trades
-        .iter()
         .filter(|t| {
-            t.meta.market == s.meta.market
-                && t.meta.exchange_ts >= s.meta.exchange_ts
-                && t.meta.exchange_ts <= end
+            t.meta.market == signal.meta.market && t.meta.exchange_ts >= signal.meta.exchange_ts
         })
-        .any(|t| match s.direction {
-            Side::Buy => (t.price / entry - 1.0) * 100.0 >= cfg.validation.hit_threshold_pct,
-            Side::Sell => (entry / t.price - 1.0) * 100.0 >= cfg.validation.hit_threshold_pct,
-        })
-}
-fn complete_horizon(s: &Signal, trades: &[Trade], cfg: &Config) -> bool {
-    let end = s.meta.exchange_ts + Duration::minutes(cfg.validation.horizon_minutes);
-    trades
+        .min_by_key(|trade| trade.meta.exchange_ts)
+        .map(|t| t.price);
+    let end = signal.meta.exchange_ts + Duration::minutes(cfg.validation.horizon_minutes);
+    let horizon = trades
         .iter()
-        .any(|t| t.meta.market == s.meta.market && t.meta.exchange_ts >= s.meta.exchange_ts)
-        && trades
+        .filter(|t| t.meta.market == signal.meta.market && t.meta.exchange_ts >= end)
+        .min_by_key(|t| t.meta.exchange_ts)
+        .map(|t| t.price);
+    let complete = entry.is_some() && horizon.is_some();
+    let reached_target = entry.map(|entry| {
+        trades
             .iter()
-            .any(|t| t.meta.market == s.meta.market && t.meta.exchange_ts >= end)
+            .filter(|t| {
+                t.meta.market == signal.meta.market
+                    && t.meta.exchange_ts >= signal.meta.exchange_ts
+                    && t.meta.exchange_ts <= end
+            })
+            .any(|t| match signal.direction {
+                Side::Buy => (t.price / entry - 1.0) * 100.0 >= cfg.validation.hit_threshold_pct,
+                Side::Sell => (entry / t.price - 1.0) * 100.0 >= cfg.validation.hit_threshold_pct,
+            })
+    });
+    SignalOutcome {
+        signal: signal.clone(),
+        rule_key: rule_key(signal),
+        entry_price: entry,
+        horizon_price: horizon,
+        reached_target,
+        complete,
+    }
+}
+
+pub fn build_outcomes(signals: &[Signal], trades: &[Trade], cfg: &Config) -> Vec<SignalOutcome> {
+    signals
+        .iter()
+        .map(|signal| outcome(signal, trades, cfg))
+        .collect()
 }
 
 fn rate(values: &[bool]) -> f64 {
@@ -290,10 +341,10 @@ fn paired_outcomes(
     for signal in signals
         .iter()
         .copied()
-        .filter(|s| complete_horizon(s, trades, cfg))
+        .filter(|s| outcome(s, trades, cfg).complete)
     {
         // The pool is matched on exactly the signal's market and UTC date.
-        let pool: Vec<&Trade> = trades
+        let mut pool: Vec<&Trade> = trades
             .iter()
             .filter(|t| {
                 t.meta.market == signal.meta.market
@@ -303,15 +354,22 @@ fn paired_outcomes(
                 let mut control = signal.clone();
                 control.meta.exchange_ts = t.meta.exchange_ts;
                 control.meta.receive_ts = t.meta.receive_ts;
-                complete_horizon(&control, trades, cfg)
+                outcome(&control, trades, cfg).complete
             })
             .collect();
+        pool.sort_by_key(|trade| {
+            serde_json::to_string(trade).expect("trade serializes for deterministic controls")
+        });
         if let Some(t) = (!pool.is_empty()).then(|| pool[rng.random_range(0..pool.len())]) {
             let mut control = signal.clone();
             control.meta.exchange_ts = t.meta.exchange_ts;
             control.meta.receive_ts = t.meta.receive_ts;
-            hits.push(is_hit(signal, trades, cfg));
-            controls.push(is_hit(&control, trades, cfg));
+            hits.push(outcome(signal, trades, cfg).reached_target.unwrap_or(false));
+            controls.push(
+                outcome(&control, trades, cfg)
+                    .reached_target
+                    .unwrap_or(false),
+            );
         }
     }
     (hits, controls)
@@ -488,14 +546,16 @@ pub fn paper(
     passed: &[String],
     cfg: &Config,
 ) -> Vec<crate::model::PaperTrade> {
+    let mut ordered_trades = trades.to_vec();
+    ordered_trades.sort_by_key(|trade| serde_json::to_string(trade).expect("trade serializes"));
     signals
         .iter()
         .filter(|s| passed.contains(&format!("{}:{}", s.signal_type, s.rule_id)))
         .filter_map(|s| {
-            let e = trades.iter().find(|t| {
+            let e = ordered_trades.iter().find(|t| {
                 t.meta.market == s.meta.market && t.meta.exchange_ts >= s.meta.exchange_ts
             })?;
-            let x = trades.iter().find(|t| {
+            let x = ordered_trades.iter().find(|t| {
                 t.meta.market == s.meta.market
                     && t.meta.exchange_ts >= s.meta.exchange_ts + Duration::minutes(15)
             })?;
