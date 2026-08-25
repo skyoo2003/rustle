@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rustle — order-book microstructure signal study</title>
-<meta name="description" content="A local, public-data-only CLI that records Upbit order-book and trade streams and measures whether the signals it detects predict anything. Not investment advice.">
+<title>Rustle — toward an automated real-time trading system for Upbit</title>
+<meta name="description" content="Building an automated real-time trading system for Upbit, validation first. Today: a public-data-only CLI that records order-book and trade streams and measures whether its signals predict anything. Not investment advice.">
 <style>
   :root { color-scheme: light dark; --fg:#1a1a1a; --bg:#fbfbf9; --dim:#5c5c57; --rule:#dcdcd4; --warn:#8a2f00; --warnbg:#fdf0e8; }
   @media (prefers-color-scheme: dark) {
@@ -23,7 +23,7 @@
           border-radius:6px; padding:1rem 1.1rem; margin:0 0 2.5rem; }
   .warn strong { display:block; margin-bottom:.35rem; }
   .warn p { margin:0; font-size:.925rem; }
-  ul { margin:0; padding-left:1.2rem; }
+  ul, ol { margin:0; padding-left:1.2rem; }
   li { margin-bottom:.4rem; }
   code { font:.875em ui-monospace, SFMono-Regular, Menlo, monospace;
          background:color-mix(in srgb, var(--fg) 8%, transparent); padding:.12em .35em; border-radius:3px; }
@@ -43,12 +43,18 @@
 
   <div class="warn">
     <strong>Not investment advice.</strong>
-    <p>Rustle is a research tool. It makes no recommendations and no performance claims, and its
-    signals are unvalidated by design — measuring whether they have any predictive power at all is
-    the entire point of the project. Provided “AS IS”, without warranties of any kind.</p>
+    <p>Rustle is, today, a research tool. It makes no recommendations and no performance claims, and
+    its signals are unvalidated by design — measuring whether they have any predictive power at all
+    is the current work. Provided “AS IS”, without warranties of any kind.</p>
   </div>
 
-  <h2>What it does</h2>
+  <h2>The goal</h2>
+  <p><strong>An automated real-time trading system for Upbit</strong> — reading the order book as it
+  moves, deciding on its own, executing without a human in the loop.</p>
+  <p>Getting there honestly means earning the right to trade first, so it is being built bottom-up.
+  Live execution is the destination; a signal that survives out-of-sample validation is the ticket.</p>
+
+  <h2>What it does today</h2>
   <p>Records public Upbit <code>trade</code> and <code>orderbook</code> streams to local Parquet
   files, detects microstructure signals in them, and measures whether those signals predicted
   anything after the fact.</p>
@@ -61,14 +67,25 @@
       days 15–28 are touched only to validate them. 28 contiguous UTC days are required.</li>
     <li><strong>A rule has to clear a bar.</strong> At least 50 validation signals and a
       wholly-positive paired-bootstrap confidence interval.</li>
-    <li><strong>No credentials, no orders.</strong> Public market data only. Simulated fills are the
-      only “execution”, and they ignore slippage, partial fills, and fees — so paper results are an
-      upper bound, not a forecast.</li>
+    <li><strong>Execution comes last, on purpose.</strong> No credentials and no order submission
+      until a signal is validated. Simulated fills are the only “execution” today, and they ignore
+      slippage, partial fills, and fees — so paper results are an upper bound, not a forecast.</li>
   </ul>
 
+  <h2>Roadmap</h2>
+  <ol>
+    <li><strong>Collect</strong> — continuous capture of public Upbit streams. <em>Working.</em></li>
+    <li><strong>Detect</strong> — explainable microstructure rules. <em>Working.</em></li>
+    <li><strong>Validate</strong> — out-of-sample proof against a random baseline. <em>Current.</em></li>
+    <li><strong>Execute (paper)</strong> — real-time decision loop, simulated fills. <em>Partial.</em></li>
+    <li><strong>Execute (live)</strong> — order submission behind risk limits and a kill switch.
+      <em>Gated on step 3.</em></li>
+  </ol>
+
   <h2>Status</h2>
-  <p>Pre-validation, with a kill gate: if detected signals show no edge over a random baseline, the
-  signal definitions change or the project stops.</p>
+  <p>Step 3 of 5, at the kill gate: if detected signals show no edge over a random baseline, the
+  signal definitions change or the project stops. An automated trader built on an unvalidated signal
+  is an expensive way to pay fees, so steps 4 and 5 stay closed until this one clears.</p>
 
   <div class="links">
     <a href="https://github.com/skyoo2003/rustle">Source</a>

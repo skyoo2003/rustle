@@ -8,16 +8,35 @@
 
 Project page: <https://skyoo2003.github.io/rustle/>
 
-A local, **public-data-only** CLI that records Upbit `trade` and `orderbook` streams, detects
-microstructure signals, and measures whether those signals actually predict anything.
+**Goal: an automated real-time trading system for Upbit** — one that reads the order book as it
+moves, decides on its own, and executes without a human in the loop.
+
+Getting there honestly means earning the right to trade first. So Rustle is built bottom-up: today
+it is a local, **public-data-only** CLI that records Upbit `trade` and `orderbook` streams, detects
+microstructure signals, and measures whether those signals actually predict anything. Live execution
+is the destination; a signal that survives out-of-sample validation is the ticket.
+
+## Roadmap
+
+| Phase | What it means | State |
+| --- | --- | --- |
+| 1. Collect | Continuous, gap-tolerant capture of public Upbit streams to Parquet | Working |
+| 2. Detect | Explainable microstructure rules, each carrying its own evidence | Working |
+| 3. Validate | Out-of-sample proof that a rule beats a random baseline | **Current — kill gate** |
+| 4. Execute (paper) | Real-time decision loop on live streams, simulated fills | Partial (`paper` runs offline) |
+| 5. Execute (live) | Credentialed order submission, position and risk limits, kill switch | Not started, gated on phase 3 |
+
+Phases 4 and 5 do not open until phase 3 passes. That ordering is the design, not caution for its
+own sake: an automated trader built on an unvalidated signal is an expensive way to pay fees.
 
 ## Disclaimer
 
-**This is not investment advice.** Rustle is a research tool for studying market microstructure.
-It publishes no recommendations, makes no performance claims, and its signals are unvalidated by
-design — measuring whether they have any predictive power at all is the entire point of the project.
+**This is not investment advice.** Rustle is, today, a research tool for studying market
+microstructure. It publishes no recommendations, makes no performance claims, and its signals are
+unvalidated by design — measuring whether they have any predictive power at all is the current work.
 
-- It holds **no API credentials** and contains **no order-submission code**. It reads public market data only.
+- It holds **no API credentials** and contains **no order-submission code**. It reads public market
+  data only. That changes only after phase 3, and only behind explicit risk limits and a kill switch.
 - Paper-trading output is an upper bound, not a forecast: it ignores slippage, partial fills, and fees.
 - Anything you do with this software is at your own risk. See [LICENSE](LICENSE) — provided "AS IS",
   without warranties or conditions of any kind.
@@ -48,14 +67,16 @@ its derived signal files and saves an evaluation audit snapshot under `evaluatio
 
 ## Status
 
-Pre-validation, and there is a kill gate: if detected signals show no edge over a random baseline,
-the signal definitions change or the project stops. Nothing downstream of that — alerting, paper
-P&L interpretation — means anything until it passes.
+Phase 3 of 5 — pre-validation, at the kill gate. If detected signals show no edge over a random
+baseline, the signal definitions change or the project stops. Nothing downstream of that gate —
+alerting, paper P&L interpretation, the live trading loop the project is aimed at — means anything
+until it passes.
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first — the project's stage narrows what's useful, and some
-categories of change (order submission, credentials, extra exchanges) are deliberately out of scope.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first — the project's stage narrows what's useful. Some
+categories of change (order submission, credentials, extra exchanges) are on the roadmap but closed
+until phase 3 clears, and one (ML-first signals) is out of scope by design.
 Participation is under the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
