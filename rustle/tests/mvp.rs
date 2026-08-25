@@ -1,6 +1,6 @@
 use chrono::{Duration, TimeZone, Utc};
 use rustle::{
-    analysis,
+    analysis::{self, SignalDetector},
     config::Config,
     model::{Level, Meta, Orderbook, Side, Trade, SCHEMA_VERSION},
     storage, upbit,
@@ -89,6 +89,26 @@ fn wall_cancel_signal_has_evidence() {
         .find(|x| x.signal_type == "wall_disappearance")
         .unwrap();
     assert!(!w.rationale.is_empty() && w.market_snapshot.get("market").is_some());
+}
+
+#[test]
+fn streaming_detector_emits_a_snapshot_bearing_signal_when_an_orderbook_arrives() {
+    let cfg = Config::default();
+    let mut detector = SignalDetector::new(&cfg);
+    let book = Orderbook {
+        meta: meta(1_000),
+        total_ask_size: 1.0,
+        total_bid_size: 9.0,
+        levels: vec![],
+    };
+
+    let signals = detector.on_orderbook(book);
+
+    assert!(signals.iter().any(|signal| {
+        signal.signal_type == "orderbook_imbalance"
+            && signal.meta.exchange_ts.timestamp_millis() == 1_000
+            && signal.market_snapshot["market"] == "KRW-TEST"
+    }));
 }
 #[test]
 fn paper_exit_is_first_trade_at_or_after_fifteen_minutes() {
