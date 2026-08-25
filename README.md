@@ -42,9 +42,15 @@ its derived signal files and saves an evaluation audit snapshot under `evaluatio
 
 ## Status
 
-Pre-validation. Milestone 2 is a kill gate: if detected signals show no edge over a random baseline,
-the signal definitions change or the project stops. Progress is tracked in
-[GitHub Milestones](https://github.com/skyoo2003/rustle/milestones).
+Pre-validation, and there is a kill gate: if detected signals show no edge over a random baseline,
+the signal definitions change or the project stops. Nothing downstream of that — alerting, paper
+P&L interpretation — means anything until it passes.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first — the project's stage narrows what's useful, and some
+categories of change (order submission, credentials, extra exchanges) are deliberately out of scope.
+Participation is under the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
 

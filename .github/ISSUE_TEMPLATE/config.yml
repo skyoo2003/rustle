@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/skyoo2003/rustle/security/advisories/new
+    about: Report privately. Please do not open a public issue for an exploitable finding.
+  - name: Which signals are profitable?
+    url: https://github.com/skyoo2003/rustle#disclaimer
+    about: Not answerable — signal efficacy is unvalidated by design. This is not investment advice.

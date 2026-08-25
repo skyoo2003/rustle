@@ -9,3 +9,6 @@ rustle.toml
 # Tooling caches / local agent config
 /.serena
 /.claude
+
+# Local-only design notes
+/docs
