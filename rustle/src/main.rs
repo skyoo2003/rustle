@@ -284,7 +284,7 @@ fn paper(cfg: &Config) -> Result<()> {
     let ids: Vec<String> = r
         .into_iter()
         .filter(|x| x.passed)
-        .filter_map(|x| x.rule_id.split(':').nth(1).map(str::to_owned))
+        .map(|x| x.rule_id)
         .collect();
     if ids.is_empty() {
         println!("paper blocked: no validation-qualified rules");
@@ -319,14 +319,17 @@ fn alert(cfg: &Config) -> Result<()> {
     let passed: Vec<String> = results(cfg)?
         .into_iter()
         .filter(|r| r.passed)
-        .filter_map(|r| r.rule_id.split(':').nth(1).map(str::to_owned))
+        .map(|r| r.rule_id)
         .collect();
     let signals = analysis::build_signals(
         storage::read_all(&root, "trades")?,
         storage::read_all(&root, "orderbooks")?,
         cfg,
     );
-    for signal in signals.iter().filter(|s| passed.contains(&s.rule_id)) {
+    for signal in signals
+        .iter()
+        .filter(|s| passed.contains(&format!("{}:{}", s.signal_type, s.rule_id)))
+    {
         println!(
             "ALERT {} {} {:?}: {}\n{}",
             signal.meta.exchange_ts,
