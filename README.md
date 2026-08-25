@@ -14,7 +14,7 @@ as it moves and tests whether explainable signals earn the right to be alerted o
 Getting there honestly means earning the right to trade first. So Rustle is built bottom-up: today
 it is a local, **public-data-only** CLI that records Upbit `trade` and `orderbook` streams, detects
 microstructure signals, and measures whether those signals actually predict anything. Live execution
-is the destination; a signal that survives out-of-sample validation is the ticket.
+is out of scope; a signal that survives out-of-sample validation is the ticket for gated alert and paper-study tools.
 
 ## Roadmap
 
@@ -26,18 +26,19 @@ is the destination; a signal that survives out-of-sample validation is the ticke
 | 4. Alert and paper | Qualified live alerts and simulated fills | Gated on phase 3 |
 | 5. Live execution | Credentialed order submission | Out of scope |
 
-Phases 4 and 5 do not open until phase 3 passes. That ordering is the design, not caution for its
-own sake: an automated trader built on an unvalidated signal is an expensive way to pay fees.
+Phases 4 and 5 do not open until phase 3 passes. That ordering is the design: an automated system
+built on an unvalidated signal is an expensive way to pay fees.
 
 ## Disclaimer
 
 **This is not investment advice.** Rustle is, today, a research tool for studying market
-microstructure. It publishes no recommendations, makes no performance claims, and its signals are
-unvalidated by design — measuring whether they have any predictive power at all is the current work.
+microstructure. It publishes no recommendations and makes no performance claims. Alerts and paper
+simulation are available only from a current, persisted validation-qualified ruleset.
 
 - It holds **no API credentials** and contains **no order-submission code**. It reads public market
   data only. That changes only after phase 3, and only behind explicit risk limits and a kill switch.
-- Paper-trading output is an upper bound, not a forecast: it ignores slippage, partial fills, and fees.
+- Paper-trading output is not a forecast: it applies configured fees and slippage but cannot model
+  queue position, partial fills, or real execution.
 - Anything you do with this software is at your own risk. See [LICENSE](LICENSE) — provided "AS IS",
   without warranties or conditions of any kind.
 
@@ -64,16 +65,15 @@ The MVP procedure is a hard gate:
 
 1. Collect continuously for 28 consecutive UTC dates. Raw `trades` and `orderbooks` are never replaced; sequence anomalies and connection gaps are recorded separately.
 2. Run `analyze`. It deterministically regenerates candidate signals and 15-minute outcomes from raw data, uses days 1–14 to tune one rule per signal type, and leaves days 15–28 untouched for validation.
-3. A rule passes only with the minimum validation sample and a wholly positive paired-bootstrap CI. Passing rules are persisted as the versioned active ruleset.
-4. Only then use `collect --emit-alerts` and `paper`. Alerts are console plus `data/alerts/.../events.jsonl`; paper output replaces prior derived trades and includes fees, slippage, win rate, cumulative net P&L, and HODL comparison.
+3. A rule passes only with the minimum validation sample and a wholly positive paired-bootstrap CI. The complete audit and a full configuration fingerprint are persisted with the versioned active ruleset.
+4. Only then use `collect --emit-alerts`, `alert`, `report`, and `paper`. Each consumes that same persisted audit/ruleset and blocks when its exact configuration fingerprint or validated collection window is stale. Paper entries must occur within 60 seconds by default; output includes fees, slippage, win rate, cumulative net P&L, and a long-only benchmark (buy at each simulated entry and sell at its exit regardless of signal side).
 
 If no rule passes, alerting and paper trading remain blocked: revise the rules or stop the project. `analyze` replaces its derived `signals`, `signal_outcomes`, evaluation, and active-ruleset files so reruns cannot accumulate stale results.
 
 ## Status
 
-Phase 3 of 4 — pre-validation, at the kill gate. If detected signals show no edge over a random
-baseline, the signal definitions change or the project stops. Nothing downstream of that gate —
-alerting or paper P&L interpretation — means anything until it passes.
+Validation is the live kill gate. Alerts and paper simulation work only after `analyze` persists a
+current qualified ruleset; a config or collection-window change requires another analysis.
 
 ## Contributing
 
