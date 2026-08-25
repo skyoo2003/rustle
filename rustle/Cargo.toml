@@ -27,7 +27,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 arrow-array = "53"
-arrow-schema = "53"
+arrow-schema = "59"
 parquet = { version = "53", features = ["arrow"] }
 
 [dev-dependencies]
