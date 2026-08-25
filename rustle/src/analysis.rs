@@ -40,9 +40,146 @@ pub struct EvaluationAudit {
 }
 #[derive(Default)]
 struct State {
-    trades: VecDeque<Trade>,
-    books: VecDeque<Orderbook>,
+    trades: VecDeque<(DateTime<Utc>, f64)>,
+    trade_notional_sum: f64,
     last_wall: Option<(f64, Side)>,
+    active_rules: BTreeSet<String>,
+}
+pub struct SignalDetector {
+    cfg: Config,
+    states: HashMap<String, State>,
+}
+impl SignalDetector {
+    pub fn new(cfg: &Config) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            states: HashMap::new(),
+        }
+    }
+
+    pub fn on_trade(&mut self, t: &Trade) -> Vec<Signal> {
+        let mut out = vec![];
+        let s = self.states.entry(t.meta.market.clone()).or_default();
+        while s.trades.front().is_some_and(|x| {
+            x.0 < t.meta.exchange_ts - Duration::seconds(self.cfg.trade_rate_window_seconds)
+        }) {
+            let (_, notional) = s.trades.pop_front().expect("front was checked");
+            s.trade_notional_sum -= notional;
+        }
+        let baseline = s.trade_notional_sum / (s.trades.len().max(1) as f64);
+        let value = t.price * t.volume;
+        for &m in &self.cfg.candidate.large_trade_multiples {
+            let rule = format!("large-{m}");
+            let active = s.trades.len() >= 5 && value > baseline * m;
+            if active && s.active_rules.insert(rule.clone()) {
+                out.push(signal(
+                    t.meta.clone(),
+                    "large_aggressive_trade",
+                    t.side,
+                    value,
+                    baseline,
+                    format!(
+                        "aggressive notional {:.0} is {:.1}x rolling mean",
+                        value,
+                        value / baseline
+                    ),
+                    rule,
+                ));
+            } else if !active {
+                s.active_rules.remove(&rule);
+            }
+        }
+        let prior = s.trades.len();
+        let rate = (prior as f64) / (self.cfg.trade_rate_window_seconds as f64);
+        let base = 5.0 / (self.cfg.trade_rate_window_seconds as f64);
+        for &m in &self.cfg.candidate.trade_rate_multiples {
+            let rule = format!("rate-{m}");
+            let active = prior >= 5 && rate > base * m;
+            if active && s.active_rules.insert(rule.clone()) {
+                out.push(signal(
+                    t.meta.clone(),
+                    "trade_rate_acceleration",
+                    t.side,
+                    rate,
+                    base,
+                    format!("{} trades in rolling window", prior),
+                    rule,
+                ));
+            } else if !active {
+                s.active_rules.remove(&rule);
+            }
+        }
+        s.trades.push_back((t.meta.exchange_ts, value));
+        s.trade_notional_sum += value;
+        out
+    }
+
+    pub fn on_orderbook(&mut self, b: &Orderbook) -> Vec<Signal> {
+        let mut out = vec![];
+        let s = self.states.entry(b.meta.market.clone()).or_default();
+        let denom = b.total_bid_size + b.total_ask_size;
+        let im = (denom > 0.0).then(|| (b.total_bid_size - b.total_ask_size) / denom);
+        for &th in &self.cfg.candidate.imbalance_thresholds {
+            let rule = format!("imbalance-{th}");
+            let active = im.is_some_and(|value| value.abs() >= th);
+            if active && s.active_rules.insert(rule.clone()) {
+                let value = im.expect("active imbalance has a value");
+                let direction = if value > 0.0 { Side::Buy } else { Side::Sell };
+                out.push(signal(
+                    b.meta.clone(),
+                    "orderbook_imbalance",
+                    direction,
+                    value,
+                    0.0,
+                    format!("bid/ask size imbalance {:.3}", value),
+                    rule,
+                ));
+            } else if !active {
+                s.active_rules.remove(&rule);
+            }
+        }
+        if b.levels.is_empty() {
+            s.last_wall = None;
+            return out;
+        }
+        let bid_wall = b
+            .levels
+            .iter()
+            .map(|level| level.bid_price * level.bid_size)
+            .fold(0.0_f64, f64::max);
+        let ask_wall = b
+            .levels
+            .iter()
+            .map(|level| level.ask_price * level.ask_size)
+            .fold(0.0_f64, f64::max);
+        let (wall, side) = if ask_wall > bid_wall {
+            (ask_wall, Side::Sell)
+        } else {
+            (bid_wall, Side::Buy)
+        };
+        if let Some((old, oldside)) = s.last_wall {
+            if old >= self.cfg.wall_min_krw && wall < old * 0.2 {
+                out.push(signal(
+                    b.meta.clone(),
+                    "wall_disappearance",
+                    oldside,
+                    wall,
+                    old,
+                    format!("previous {:.0} KRW {:?} wall disappeared", old, oldside),
+                    "wall-drop".into(),
+                ));
+            }
+        }
+        s.last_wall = Some((wall, side));
+        out
+    }
+
+    /// Drop rolling observations for markets which are no longer in the live universe.
+    pub fn retain_markets(&mut self, markets: &[String]) {
+        let markets: BTreeSet<&str> = markets.iter().map(String::as_str).collect();
+        self.states
+            .retain(|market, _| markets.contains(market.as_str()));
+    }
 }
 struct SelectedCandidate<'a> {
     id: String,
@@ -55,8 +192,8 @@ pub fn build_signals(
     mut books: Vec<Orderbook>,
     cfg: &Config,
 ) -> Vec<Signal> {
-    trades.sort_by_key(|t| t.meta.exchange_ts);
-    books.sort_by_key(|b| b.meta.exchange_ts);
+    trades.sort_by_key(|trade| serde_json::to_string(trade).expect("trade serializes"));
+    books.sort_by_key(|book| serde_json::to_string(book).expect("orderbook serializes"));
     let mut events: Vec<(DateTime<Utc>, bool, usize)> = trades
         .iter()
         .enumerate()
@@ -68,103 +205,14 @@ pub fn build_signals(
                 .map(|(i, b)| (b.meta.exchange_ts, false, i)),
         )
         .collect();
-    events.sort_by_key(|x| x.0);
-    let mut states: HashMap<String, State> = HashMap::new();
+    events.sort_by_key(|event| (event.0, event.1, event.2));
+    let mut detector = SignalDetector::new(cfg);
     let mut out = vec![];
     for (_, is_trade, i) in events {
         if is_trade {
-            let t = &trades[i];
-            let s = states.entry(t.meta.market.clone()).or_default();
-            while s.trades.front().is_some_and(|x| {
-                x.meta.exchange_ts
-                    < t.meta.exchange_ts - Duration::seconds(cfg.trade_rate_window_seconds)
-            }) {
-                s.trades.pop_front();
-            }
-            let baseline = s.trades.iter().map(|x| x.price * x.volume).sum::<f64>()
-                / (s.trades.len().max(1) as f64);
-            let value = t.price * t.volume;
-            for &m in &cfg.candidate.large_trade_multiples {
-                if s.trades.len() >= 5 && value > baseline * m {
-                    out.push(signal(
-                        t.meta.clone(),
-                        "large_aggressive_trade",
-                        t.side,
-                        value,
-                        baseline,
-                        format!(
-                            "aggressive notional {:.0} is {:.1}x rolling mean",
-                            value,
-                            value / baseline
-                        ),
-                        format!("large-{m}"),
-                    ));
-                }
-            }
-            let prior = s.trades.len();
-            s.trades.push_back(t.clone());
-            if prior >= 5 {
-                let rate = (prior as f64) / (cfg.trade_rate_window_seconds as f64);
-                let base = 5.0 / (cfg.trade_rate_window_seconds as f64);
-                for &m in &cfg.candidate.trade_rate_multiples {
-                    if rate > base * m {
-                        out.push(signal(
-                            t.meta.clone(),
-                            "trade_rate_acceleration",
-                            t.side,
-                            rate,
-                            base,
-                            format!("{} trades in rolling window", prior),
-                            format!("rate-{m}"),
-                        ));
-                    }
-                }
-            }
+            out.extend(detector.on_trade(&trades[i]));
         } else {
-            let b = &books[i];
-            let s = states.entry(b.meta.market.clone()).or_default();
-            let denom = b.total_bid_size + b.total_ask_size;
-            if denom > 0.0 {
-                let im = (b.total_bid_size - b.total_ask_size) / denom;
-                for &th in &cfg.candidate.imbalance_thresholds {
-                    if im.abs() >= th {
-                        let d = if im > 0.0 { Side::Buy } else { Side::Sell };
-                        out.push(signal(
-                            b.meta.clone(),
-                            "orderbook_imbalance",
-                            d,
-                            im,
-                            0.0,
-                            format!("bid/ask size imbalance {:.3}", im),
-                            format!("imbalance-{th}"),
-                        ));
-                    }
-                }
-            }
-            let (wall, side) = b.levels.iter().fold((0.0, Side::Buy), |(best, bs), l| {
-                if l.bid_price * l.bid_size > best {
-                    (l.bid_price * l.bid_size, Side::Buy)
-                } else if l.ask_price * l.ask_size > best {
-                    (l.ask_price * l.ask_size, Side::Sell)
-                } else {
-                    (best, bs)
-                }
-            });
-            if let Some((old, oldside)) = s.last_wall {
-                if old >= cfg.wall_min_krw && wall < old * 0.2 {
-                    out.push(signal(
-                        b.meta.clone(),
-                        "wall_disappearance",
-                        oldside,
-                        wall,
-                        old,
-                        format!("previous {:.0} KRW {:?} wall disappeared", old, oldside),
-                        "wall-drop".into(),
-                    ));
-                }
-            }
-            s.last_wall = Some((wall, side));
-            s.books.push_back(b.clone());
+            out.extend(detector.on_orderbook(&books[i]));
         }
     }
     out
