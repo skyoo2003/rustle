@@ -28,7 +28,7 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 arrow-array = "53"
 arrow-schema = "53"
-parquet = { version = "53", features = ["arrow"] }
+parquet = { version = "54", features = ["arrow"] }
 
 [dev-dependencies]
 tempfile = "3"
