@@ -130,10 +130,7 @@ fn paper_only_uses_the_validation_qualified_signal_type_and_rule() {
     qualified.signal_type = "qualified".into();
     let mut unqualified = qualified.clone();
     unqualified.signal_type = "unqualified".into();
-    let trades = vec![
-        dated_trade(0, 0, 100.0),
-        dated_trade(0, 15, 101.0),
-    ];
+    let trades = vec![dated_trade(0, 0, 100.0), dated_trade(0, 15, 101.0)];
 
     let paper = analysis::paper(
         &[qualified, unqualified],
