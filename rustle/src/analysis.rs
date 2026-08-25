@@ -44,6 +44,117 @@ struct State {
     books: VecDeque<Orderbook>,
     last_wall: Option<(f64, Side)>,
 }
+pub struct SignalDetector {
+    cfg: Config,
+    states: HashMap<String, State>,
+}
+impl SignalDetector {
+    pub fn new(cfg: &Config) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            states: HashMap::new(),
+        }
+    }
+
+    pub fn on_trade(&mut self, t: Trade) -> Vec<Signal> {
+        let mut out = vec![];
+        let s = self.states.entry(t.meta.market.clone()).or_default();
+        while s.trades.front().is_some_and(|x| {
+            x.meta.exchange_ts
+                < t.meta.exchange_ts - Duration::seconds(self.cfg.trade_rate_window_seconds)
+        }) {
+            s.trades.pop_front();
+        }
+        let baseline = s.trades.iter().map(|x| x.price * x.volume).sum::<f64>()
+            / (s.trades.len().max(1) as f64);
+        let value = t.price * t.volume;
+        for &m in &self.cfg.candidate.large_trade_multiples {
+            if s.trades.len() >= 5 && value > baseline * m {
+                out.push(signal(
+                    t.meta.clone(),
+                    "large_aggressive_trade",
+                    t.side,
+                    value,
+                    baseline,
+                    format!(
+                        "aggressive notional {:.0} is {:.1}x rolling mean",
+                        value,
+                        value / baseline
+                    ),
+                    format!("large-{m}"),
+                ));
+            }
+        }
+        let prior = s.trades.len();
+        s.trades.push_back(t.clone());
+        if prior >= 5 {
+            let rate = (prior as f64) / (self.cfg.trade_rate_window_seconds as f64);
+            let base = 5.0 / (self.cfg.trade_rate_window_seconds as f64);
+            for &m in &self.cfg.candidate.trade_rate_multiples {
+                if rate > base * m {
+                    out.push(signal(
+                        t.meta.clone(),
+                        "trade_rate_acceleration",
+                        t.side,
+                        rate,
+                        base,
+                        format!("{} trades in rolling window", prior),
+                        format!("rate-{m}"),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn on_orderbook(&mut self, b: Orderbook) -> Vec<Signal> {
+        let mut out = vec![];
+        let s = self.states.entry(b.meta.market.clone()).or_default();
+        let denom = b.total_bid_size + b.total_ask_size;
+        if denom > 0.0 {
+            let im = (b.total_bid_size - b.total_ask_size) / denom;
+            for &th in &self.cfg.candidate.imbalance_thresholds {
+                if im.abs() >= th {
+                    let d = if im > 0.0 { Side::Buy } else { Side::Sell };
+                    out.push(signal(
+                        b.meta.clone(),
+                        "orderbook_imbalance",
+                        d,
+                        im,
+                        0.0,
+                        format!("bid/ask size imbalance {:.3}", im),
+                        format!("imbalance-{th}"),
+                    ));
+                }
+            }
+        }
+        let (wall, side) = b.levels.iter().fold((0.0, Side::Buy), |(best, bs), l| {
+            if l.bid_price * l.bid_size > best {
+                (l.bid_price * l.bid_size, Side::Buy)
+            } else if l.ask_price * l.ask_size > best {
+                (l.ask_price * l.ask_size, Side::Sell)
+            } else {
+                (best, bs)
+            }
+        });
+        if let Some((old, oldside)) = s.last_wall {
+            if old >= self.cfg.wall_min_krw && wall < old * 0.2 {
+                out.push(signal(
+                    b.meta.clone(),
+                    "wall_disappearance",
+                    oldside,
+                    wall,
+                    old,
+                    format!("previous {:.0} KRW {:?} wall disappeared", old, oldside),
+                    "wall-drop".into(),
+                ));
+            }
+        }
+        s.last_wall = Some((wall, side));
+        s.books.push_back(b);
+        out
+    }
+}
 struct SelectedCandidate<'a> {
     id: String,
     signals: Vec<&'a Signal>,
@@ -69,102 +180,13 @@ pub fn build_signals(
         )
         .collect();
     events.sort_by_key(|x| x.0);
-    let mut states: HashMap<String, State> = HashMap::new();
+    let mut detector = SignalDetector::new(cfg);
     let mut out = vec![];
     for (_, is_trade, i) in events {
         if is_trade {
-            let t = &trades[i];
-            let s = states.entry(t.meta.market.clone()).or_default();
-            while s.trades.front().is_some_and(|x| {
-                x.meta.exchange_ts
-                    < t.meta.exchange_ts - Duration::seconds(cfg.trade_rate_window_seconds)
-            }) {
-                s.trades.pop_front();
-            }
-            let baseline = s.trades.iter().map(|x| x.price * x.volume).sum::<f64>()
-                / (s.trades.len().max(1) as f64);
-            let value = t.price * t.volume;
-            for &m in &cfg.candidate.large_trade_multiples {
-                if s.trades.len() >= 5 && value > baseline * m {
-                    out.push(signal(
-                        t.meta.clone(),
-                        "large_aggressive_trade",
-                        t.side,
-                        value,
-                        baseline,
-                        format!(
-                            "aggressive notional {:.0} is {:.1}x rolling mean",
-                            value,
-                            value / baseline
-                        ),
-                        format!("large-{m}"),
-                    ));
-                }
-            }
-            let prior = s.trades.len();
-            s.trades.push_back(t.clone());
-            if prior >= 5 {
-                let rate = (prior as f64) / (cfg.trade_rate_window_seconds as f64);
-                let base = 5.0 / (cfg.trade_rate_window_seconds as f64);
-                for &m in &cfg.candidate.trade_rate_multiples {
-                    if rate > base * m {
-                        out.push(signal(
-                            t.meta.clone(),
-                            "trade_rate_acceleration",
-                            t.side,
-                            rate,
-                            base,
-                            format!("{} trades in rolling window", prior),
-                            format!("rate-{m}"),
-                        ));
-                    }
-                }
-            }
+            out.extend(detector.on_trade(trades[i].clone()));
         } else {
-            let b = &books[i];
-            let s = states.entry(b.meta.market.clone()).or_default();
-            let denom = b.total_bid_size + b.total_ask_size;
-            if denom > 0.0 {
-                let im = (b.total_bid_size - b.total_ask_size) / denom;
-                for &th in &cfg.candidate.imbalance_thresholds {
-                    if im.abs() >= th {
-                        let d = if im > 0.0 { Side::Buy } else { Side::Sell };
-                        out.push(signal(
-                            b.meta.clone(),
-                            "orderbook_imbalance",
-                            d,
-                            im,
-                            0.0,
-                            format!("bid/ask size imbalance {:.3}", im),
-                            format!("imbalance-{th}"),
-                        ));
-                    }
-                }
-            }
-            let (wall, side) = b.levels.iter().fold((0.0, Side::Buy), |(best, bs), l| {
-                if l.bid_price * l.bid_size > best {
-                    (l.bid_price * l.bid_size, Side::Buy)
-                } else if l.ask_price * l.ask_size > best {
-                    (l.ask_price * l.ask_size, Side::Sell)
-                } else {
-                    (best, bs)
-                }
-            });
-            if let Some((old, oldside)) = s.last_wall {
-                if old >= cfg.wall_min_krw && wall < old * 0.2 {
-                    out.push(signal(
-                        b.meta.clone(),
-                        "wall_disappearance",
-                        oldside,
-                        wall,
-                        old,
-                        format!("previous {:.0} KRW {:?} wall disappeared", old, oldside),
-                        "wall-drop".into(),
-                    ));
-                }
-            }
-            s.last_wall = Some((wall, side));
-            s.books.push_back(b.clone());
+            out.extend(detector.on_orderbook(books[i].clone()));
         }
     }
     out

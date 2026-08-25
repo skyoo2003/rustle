@@ -129,8 +129,10 @@ async fn collect(cfg: &Config, once: bool) -> Result<()> {
                 delay = 1;
                 let mut ts = Vec::new();
                 let mut bs = Vec::new();
+                let mut ss = Vec::new();
+                let mut detector = analysis::SignalDetector::new(cfg);
                 loop {
-                    tokio::select! { _=tokio::signal::ctrl_c()=>{flush(&root,&mut ts,&mut bs)?;return Ok(())}, got=upbit::next(&mut ws)=>match got {Ok(Some(Incoming::Trade(t)))=>{ts.push(t);if ts.len()>=100{flush(&root,&mut ts,&mut bs)?}},Ok(Some(Incoming::Orderbook(b)))=>{bs.push(b);if bs.len()>=100{flush(&root,&mut ts,&mut bs)?}},Ok(None)=>{},Err(e)=>{flush(&root,&mut ts,&mut bs)?;eprintln!("connection ended: {e}");break}} }
+                    tokio::select! { _=tokio::signal::ctrl_c()=>{flush(&root,&mut ts,&mut bs,&mut ss)?;return Ok(())}, got=upbit::next(&mut ws)=>match got {Ok(Some(Incoming::Trade(t)))=>{ss.extend(detector.on_trade(t.clone()));ts.push(t);if ts.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}},Ok(Some(Incoming::Orderbook(b)))=>{ss.extend(detector.on_orderbook(b.clone()));bs.push(b);if bs.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}},Ok(None)=>{},Err(e)=>{flush(&root,&mut ts,&mut bs,&mut ss)?;eprintln!("connection ended: {e}");break}} }
                 }
             }
             Err(e) => eprintln!("connect failed: {e}"),
@@ -165,6 +167,7 @@ fn flush(
     root: &Path,
     trades: &mut Vec<rustle::model::Trade>,
     books: &mut Vec<rustle::model::Orderbook>,
+    signals: &mut Vec<rustle::model::Signal>,
 ) -> Result<()> {
     use std::collections::HashMap;
     let mut tg: HashMap<String, Vec<rustle::model::Trade>> = HashMap::new();
@@ -180,6 +183,15 @@ fn flush(
     }
     for (m, x) in bg {
         storage::write(root, "orderbooks", &m, x[0].meta.exchange_ts, &x)?;
+    }
+    let mut sg: HashMap<String, Vec<rustle::model::Signal>> = HashMap::new();
+    for signal in signals.drain(..) {
+        sg.entry(signal.meta.market.clone())
+            .or_default()
+            .push(signal)
+    }
+    for (m, x) in sg {
+        storage::write(root, "signals", &m, x[0].meta.exchange_ts, &x)?;
     }
     Ok(())
 }
