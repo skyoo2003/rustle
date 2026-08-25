@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{NaiveDate, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use rustle::{
@@ -95,7 +95,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
     let mut delay = 1u64;
     let mut disconnected_at = None;
     let mut detector = analysis::SignalDetector::new(cfg);
-    let active_rules = active_ruleset(&root)?;
+    let active_rules = load_fresh_ruleset(&root, cfg).ok().map(|set| set.rules);
     if emit_alerts && active_rules.as_ref().is_none_or(|rules| rules.is_empty()) {
         eprintln!("alerts blocked: no active validation-qualified ruleset; collection continues");
     }
@@ -118,7 +118,6 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                     markets: markets.clone(),
                 }],
             )?;
-            detector.retain_markets(&markets);
             detector.reset();
             record_connection(
                 &root,
@@ -163,14 +162,50 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                 let mut bs = Vec::new();
                 let mut ss = Vec::new();
                 loop {
-                    tokio::select! { _=tokio::signal::ctrl_c()=>{flush(&root,&mut ts,&mut bs,&mut ss)?;return Ok(())}, got=upbit::next(&mut ws)=>match got {Ok(Some(Incoming::Trade(t)))=>{
-                        if sequence_ok(&mut sequences, &t, &root)? { let new = detector.on_trade(&t); emit_live_alerts(&root, active_rules.as_deref(), emit_alerts, &new)?; ss.extend(new); ts.push(t); }
-                        if ts.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}
-                    },Ok(Some(Incoming::Orderbook(b)))=>{let new=detector.on_orderbook(&b);emit_live_alerts(&root, active_rules.as_deref(), emit_alerts, &new)?;ss.extend(new);bs.push(b);if bs.len()>=100{flush(&root,&mut ts,&mut bs,&mut ss)?}},Ok(None)=>{},Err(e)=>{flush(&root,&mut ts,&mut bs,&mut ss)?;disconnected_at=Some(Utc::now());record_connection(&root,"disconnected",&e.to_string(),None)?;eprintln!("connection ended: {e}");break}} }
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => { flush(&root, &mut ts, &mut bs, &mut ss)?; return Ok(()); }
+                        got = upbit::next(&mut ws) => match got {
+                            Ok(Some(Incoming::Trade(t))) => {
+                                // Raw capture is authoritative: sequence checks only suppress detector state.
+                                ts.push(t.clone());
+                                let handled: Result<()> = (|| {
+                                    if sequence_ok(&mut sequences, &t, &root)? {
+                                        let new = detector.on_trade(&t);
+                                        emit_live_alerts(&root, active_rules.as_deref(), emit_alerts, &new)?;
+                                        ss.extend(new);
+                                    }
+                                    let should_flush = ts.len() >= 100;
+                                    if should_flush { flush(&root, &mut ts, &mut bs, &mut ss)?; }
+                                    Ok(())
+                                })();
+                                if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
+                            }
+                            Ok(Some(Incoming::Orderbook(b))) => {
+                                bs.push(b.clone());
+                                let handled: Result<()> = (|| {
+                                    let new = detector.on_orderbook(&b);
+                                    emit_live_alerts(&root, active_rules.as_deref(), emit_alerts, &new)?;
+                                    ss.extend(new);
+                                    if bs.len() >= 100 { flush(&root, &mut ts, &mut bs, &mut ss)?; }
+                                    Ok(())
+                                })();
+                                if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                flush(&root, &mut ts, &mut bs, &mut ss)?;
+                                disconnected_at = Some(Utc::now());
+                                record_connection(&root, "disconnected", &e.to_string(), None)?;
+                                eprintln!("connection ended: {e}");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
                 disconnected_at.get_or_insert_with(Utc::now);
+                record_connection(&root, "connect_failed", &e.to_string(), None)?;
                 eprintln!("connect failed: {e}")
             }
         };
@@ -249,26 +284,31 @@ fn sequence_ok(
             )?;
             Ok(false)
         }
-        Some(last) if id > last + 1 => {
-            record_connection(
-                root,
-                "integrity_gap",
-                &format!("{market} missing {} sequential ids", id - last - 1),
-                None,
-            )?;
-            sequences.insert(market, id);
-            Ok(true)
-        }
         _ => {
             sequences.insert(market, id);
             Ok(true)
         }
     }
 }
-fn active_ruleset(root: &Path) -> Result<Option<Vec<String>>> {
+fn load_fresh_ruleset(root: &Path, cfg: &Config) -> Result<QualifiedRuleSet> {
     let mut sets: Vec<QualifiedRuleSet> = storage::read_all(root, "active_rule_sets")?;
     sets.sort_by_key(|set| set.created_at);
-    Ok(sets.pop().map(|set| set.rules))
+    let set = sets
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("no persisted ruleset; run analyze"))?;
+    let audit = set
+        .audit
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("ruleset is from an older format; run analyze"))?;
+    if set.config_fingerprint.as_deref() != Some(&analysis::config_fingerprint(cfg)) {
+        bail!("ruleset is stale because configuration changed; run analyze");
+    }
+    let trades = storage::read_all(root, "trades")?;
+    let books = storage::read_all(root, "orderbooks")?;
+    if audit.collection_dates != analysis::current_collection_dates(&trades, &books, cfg)? {
+        bail!("ruleset is stale because its collection window changed; run analyze");
+    }
+    Ok(set)
 }
 fn emit_live_alerts(
     root: &Path,
@@ -381,22 +421,18 @@ fn analyze(cfg: &Config) -> Result<()> {
         "ALL",
         Utc::now(),
         &[QualifiedRuleSet {
-            version: 1,
+            version: 2,
             created_at: Utc::now(),
             tuning_start: audit.input_start,
-            tuning_end: audit
-                .results
-                .first()
-                .map(|r| r.tuning_end)
-                .unwrap_or(audit.input_start),
-            validation_start: audit
-                .results
-                .first()
-                .map(|r| r.validation_start)
-                .unwrap_or(audit.input_end),
+            tuning_end: audit.input_start
+                + chrono::Duration::days((cfg.validation.tuning_days - 1) as i64),
+            validation_start: audit.input_start
+                + chrono::Duration::days(cfg.validation.tuning_days as i64),
             validation_end: audit.input_end,
             bootstrap_seed: audit.bootstrap_seed,
             rules,
+            audit: Some(audit.clone()),
+            config_fingerprint: Some(analysis::config_fingerprint(cfg)),
         }],
     )?;
     println!(
@@ -406,21 +442,17 @@ fn analyze(cfg: &Config) -> Result<()> {
     );
     Ok(())
 }
-fn results(cfg: &Config) -> Result<Vec<analysis::RuleResult>> {
-    let root = PathBuf::from(&cfg.data_root);
-    let trades = storage::read_all(&root, "trades")?;
-    let books = storage::read_all(&root, "orderbooks")?;
-    // Do not trust accumulated signal files: always regenerate candidates from raw input.
-    let signals = analysis::build_signals(trades.clone(), books.clone(), cfg);
-    analysis::evaluate(&signals, &trades, &books, cfg)
-}
 fn report(cfg: &Config, csv: bool) -> Result<()> {
-    let r = results(cfg)?;
+    let root = PathBuf::from(&cfg.data_root);
+    let r = &load_fresh_ruleset(&root, cfg)?
+        .audit
+        .expect("fresh loader requires audit")
+        .results;
     if csv {
         println!(
             "signal_type,rule_id,tuning_start,tuning_end,validation_start,validation_end,train_count,train_hit_rate,validation_count,validation_hit_rate,random_hit_rate,lift,ci_low,ci_high,passed"
         );
-        for x in &r {
+        for x in r {
             println!(
                 "{},{},{},{},{},{},{},{:.4},{},{:.4},{:.4},{:.4},{:.4},{:.4},{}",
                 x.signal_type,
@@ -442,7 +474,7 @@ fn report(cfg: &Config, csv: bool) -> Result<()> {
         }
     } else {
         println!("# Rustle validation report\n\n| Signal type | Selected rule | Tuning | Validation | Train n / hit | Validation n / hit | Matched random | Lift | 95% CI | Pass |\n|---|---|---|---|---|---|---:|---:|---|---|");
-        for x in &r {
+        for x in r {
             println!(
                 "| {} | {} | {}–{} | {}–{} | {} / {:.1}% | {} / {:.1}% | {:.1}% | {:.1}% | [{:.1}%, {:.1}%] | {} |",
                 x.signal_type,
@@ -471,7 +503,7 @@ fn report(cfg: &Config, csv: bool) -> Result<()> {
 }
 fn paper(cfg: &Config) -> Result<()> {
     let root = PathBuf::from(&cfg.data_root);
-    let ids = active_ruleset(&root)?.unwrap_or_default();
+    let ids = load_fresh_ruleset(&root, cfg)?.rules;
     if ids.is_empty() {
         storage::clear_dataset(&root, "paper_trades")?;
         storage::clear_dataset(&root, "paper_summaries")?;
@@ -495,7 +527,10 @@ fn paper(cfg: &Config) -> Result<()> {
         cumulative_net_pnl_pct: p.iter().map(|trade| trade.net_pnl_pct).sum(),
         win_rate: p.iter().filter(|trade| trade.net_pnl_pct > 0.0).count() as f64
             / paper_count.max(1) as f64,
-        hodl_benchmark_pnl_pct: p.iter().map(|trade| trade.benchmark_pnl_pct).sum(),
+        long_only_benchmark_pnl_pct: p
+            .iter()
+            .map(|trade| trade.long_only_benchmark_pnl_pct)
+            .sum(),
     };
     storage::clear_dataset(&root, "paper_trades")?;
     write_partitioned(&root, "paper_trades", p, |paper_trade| {
@@ -510,18 +545,18 @@ fn paper(cfg: &Config) -> Result<()> {
         std::slice::from_ref(&summary),
     )?;
     println!(
-        "simulated {} paper trades; net {:.3}%, win {:.1}%, HODL {:.3}%",
+        "simulated {} paper trades; net {:.3}%, win {:.1}%, long-only benchmark {:.3}%",
         summary.trade_count,
         summary.cumulative_net_pnl_pct,
         summary.win_rate * 100.0,
-        summary.hodl_benchmark_pnl_pct
+        summary.long_only_benchmark_pnl_pct
     );
     Ok(())
 }
 
 fn alert(cfg: &Config) -> Result<()> {
     let root = PathBuf::from(&cfg.data_root);
-    let passed = active_ruleset(&root)?.unwrap_or_default();
+    let passed = load_fresh_ruleset(&root, cfg)?.rules;
     let signals = analysis::build_signals(
         storage::read_all(&root, "trades")?,
         storage::read_all(&root, "orderbooks")?,
@@ -605,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn sequence_tracker_records_duplicate_reverse_and_gap_events() {
+    fn sequence_tracker_records_duplicate_and_reverse_events_but_not_id_gaps() {
         let dir = tempfile::tempdir().unwrap();
         let mut tracker = HashMap::new();
         let trade = |id| Trade {
@@ -625,12 +660,7 @@ mod tests {
             events.iter().map(|event| event.state.as_str()).collect();
         assert_eq!(
             states,
-            [
-                "integrity_duplicate",
-                "integrity_gap",
-                "integrity_out_of_order"
-            ]
-            .into()
+            ["integrity_duplicate", "integrity_out_of_order"].into()
         );
     }
 }

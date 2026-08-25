@@ -30,7 +30,7 @@ pub struct Orderbook {
     pub total_bid_size: f64,
     pub levels: Vec<Level>,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Side {
     Buy,
@@ -67,7 +67,7 @@ pub struct PaperTrade {
     pub exit_price: f64,
     pub gross_pnl_pct: f64,
     pub net_pnl_pct: f64,
-    pub benchmark_pnl_pct: f64,
+    pub long_only_benchmark_pnl_pct: f64,
 }
 
 /// The replayable result of one candidate signal.  `complete` is deliberately
@@ -93,6 +93,11 @@ pub struct QualifiedRuleSet {
     pub validation_end: chrono::NaiveDate,
     pub bootstrap_seed: u64,
     pub rules: Vec<String>,
+    /// Missing fields on older files deliberately deserialize as stale.
+    #[serde(default)]
+    pub audit: Option<crate::analysis::EvaluationAudit>,
+    #[serde(default)]
+    pub config_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,5 +113,5 @@ pub struct PaperSummary {
     pub trade_count: usize,
     pub cumulative_net_pnl_pct: f64,
     pub win_rate: f64,
-    pub hodl_benchmark_pnl_pct: f64,
+    pub long_only_benchmark_pnl_pct: f64,
 }

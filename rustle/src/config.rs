@@ -34,6 +34,9 @@ pub struct ValidationConfig {
     #[serde(default = "default_min_validation_signals")]
     pub min_validation_signals: usize,
     pub horizon_minutes: i64,
+    /// Maximum delay after a signal at which the first trade is executable.
+    #[serde(default = "default_entry_max_lag_seconds")]
+    pub entry_max_lag_seconds: i64,
     pub hit_threshold_pct: f64,
     pub bootstrap_iterations: usize,
     pub bootstrap_seed: u64,
@@ -46,6 +49,9 @@ fn default_validation_days() -> usize {
 }
 fn default_min_validation_signals() -> usize {
     50
+}
+fn default_entry_max_lag_seconds() -> i64 {
+    60
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperConfig {
@@ -72,6 +78,7 @@ impl Default for Config {
                 validation_days: 14,
                 min_validation_signals: 50,
                 horizon_minutes: 15,
+                entry_max_lag_seconds: 60,
                 hit_threshold_pct: 0.3,
                 bootstrap_iterations: 1000,
                 bootstrap_seed: 7,

@@ -8,7 +8,10 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 // now just the core trait re-exported from rand_core — into `RngExt`.
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleResult {
@@ -37,6 +40,51 @@ pub struct EvaluationAudit {
     pub validation_config: crate::config::ValidationConfig,
     pub bootstrap_seed: u64,
     pub results: Vec<RuleResult>,
+}
+/// A deterministic fingerprint of every configuration value that can affect collection,
+/// detection, replay, or validation.
+pub fn config_fingerprint(cfg: &Config) -> String {
+    let bytes = serde_json::to_vec(cfg).expect("config serializes");
+    let hash = bytes.into_iter().fold(0xcbf29ce484222325u64, |h, byte| {
+        (h ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("fnv1a64:{hash:016x}")
+}
+
+pub fn current_collection_dates(
+    trades: &[Trade],
+    books: &[Orderbook],
+    cfg: &Config,
+) -> Result<Vec<NaiveDate>> {
+    let required = cfg.validation.tuning_days + cfg.validation.validation_days;
+    if cfg.validation.tuning_days == 0 || cfg.validation.validation_days == 0 {
+        bail!("tuning_days and validation_days must both be greater than zero");
+    }
+    let dates: BTreeSet<NaiveDate> = trades
+        .iter()
+        .map(|t| t.meta.exchange_ts.date_naive())
+        .chain(books.iter().map(|b| b.meta.exchange_ts.date_naive()))
+        .collect();
+    if dates.is_empty() {
+        bail!("need {required} UTC collection dates, found none");
+    }
+    let end = *dates.iter().next_back().expect("checked non-empty");
+    let start = end - Duration::days((required - 1) as i64);
+    let expected: Vec<_> = (0..required)
+        .map(|i| start + Duration::days(i as i64))
+        .collect();
+    let missing: Vec<_> = expected.iter().filter(|d| !dates.contains(d)).collect();
+    if !missing.is_empty() {
+        bail!(
+            "missing UTC collection dates: {}",
+            missing
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(expected)
 }
 #[derive(Default)]
 struct State {
@@ -199,12 +247,6 @@ impl SignalDetector {
     }
 
     /// Drop rolling observations for markets which are no longer in the live universe.
-    pub fn retain_markets(&mut self, markets: &[String]) {
-        let markets: BTreeSet<&str> = markets.iter().map(String::as_str).collect();
-        self.states
-            .retain(|market, _| markets.contains(market.as_str()));
-    }
-
     /// A reconnect is a discontinuity: never carry a rolling baseline across it.
     pub fn reset(&mut self) {
         self.states.clear();
@@ -221,8 +263,8 @@ pub fn build_signals(
     mut books: Vec<Orderbook>,
     cfg: &Config,
 ) -> Vec<Signal> {
-    trades.sort_by_key(|trade| serde_json::to_string(trade).expect("trade serializes"));
-    books.sort_by_key(|book| serde_json::to_string(book).expect("orderbook serializes"));
+    trades.sort_by(trade_cmp);
+    books.sort_by(book_cmp);
     let mut events: Vec<(DateTime<Utc>, bool, usize)> = trades
         .iter()
         .enumerate()
@@ -245,6 +287,40 @@ pub fn build_signals(
         }
     }
     out
+}
+fn trade_cmp(a: &Trade, b: &Trade) -> Ordering {
+    a.meta
+        .exchange_ts
+        .cmp(&b.meta.exchange_ts)
+        .then_with(|| a.meta.receive_ts.cmp(&b.meta.receive_ts))
+        .then_with(|| a.meta.market.cmp(&b.meta.market))
+        .then_with(|| a.sequential_id.cmp(&b.sequential_id))
+        .then_with(|| a.price.total_cmp(&b.price))
+        .then_with(|| a.volume.total_cmp(&b.volume))
+        .then_with(|| (a.side as u8).cmp(&(b.side as u8)))
+}
+fn book_cmp(a: &Orderbook, b: &Orderbook) -> Ordering {
+    a.meta
+        .exchange_ts
+        .cmp(&b.meta.exchange_ts)
+        .then_with(|| a.meta.receive_ts.cmp(&b.meta.receive_ts))
+        .then_with(|| a.meta.market.cmp(&b.meta.market))
+        .then_with(|| a.total_ask_size.total_cmp(&b.total_ask_size))
+        .then_with(|| a.total_bid_size.total_cmp(&b.total_bid_size))
+        .then_with(|| {
+            a.levels
+                .iter()
+                .zip(&b.levels)
+                .map(|(left, right)| {
+                    left.ask_price
+                        .total_cmp(&right.ask_price)
+                        .then_with(|| left.bid_price.total_cmp(&right.bid_price))
+                        .then_with(|| left.ask_size.total_cmp(&right.ask_size))
+                        .then_with(|| left.bid_size.total_cmp(&right.bid_size))
+                })
+                .find(|order| *order != Ordering::Equal)
+                .unwrap_or_else(|| a.levels.len().cmp(&b.levels.len()))
+        })
 }
 #[allow(clippy::too_many_arguments)] // inputs mirror the persisted Signal fields plus provenance
 fn signal(
@@ -272,48 +348,109 @@ pub fn rule_key(signal: &Signal) -> String {
     format!("{}:{}", signal.signal_type, signal.rule_id)
 }
 
-pub fn outcome(signal: &Signal, trades: &[Trade], cfg: &Config) -> SignalOutcome {
-    let entry = trades
-        .iter()
-        .filter(|t| {
-            t.meta.market == signal.meta.market && t.meta.exchange_ts >= signal.meta.exchange_ts
-        })
-        .min_by_key(|trade| trade.meta.exchange_ts)
-        .map(|t| t.price);
-    let end = signal.meta.exchange_ts + Duration::minutes(cfg.validation.horizon_minutes);
-    let horizon = trades
-        .iter()
-        .filter(|t| t.meta.market == signal.meta.market && t.meta.exchange_ts >= end)
-        .min_by_key(|t| t.meta.exchange_ts)
-        .map(|t| t.price);
+struct TradeIndex<'a> {
+    by_market: HashMap<&'a str, Vec<&'a Trade>>,
+}
+impl<'a> TradeIndex<'a> {
+    fn new(trades: &'a [Trade]) -> Self {
+        let mut by_market: HashMap<&str, Vec<&Trade>> = HashMap::new();
+        for trade in trades {
+            by_market.entry(&trade.meta.market).or_default().push(trade);
+        }
+        for values in by_market.values_mut() {
+            values.sort_by(|a, b| trade_cmp(a, b));
+        }
+        Self { by_market }
+    }
+    fn at_or_after(&self, market: &str, time: DateTime<Utc>) -> Option<&'a Trade> {
+        let values = self.by_market.get(market)?;
+        let pos = values.partition_point(|trade| trade.meta.exchange_ts < time);
+        values.get(pos).copied()
+    }
+    fn on_date(&self, market: &str, date: NaiveDate) -> &[&'a Trade] {
+        let Some(values) = self.by_market.get(market) else {
+            return &[];
+        };
+        let start = date.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+        let end = start + Duration::days(1);
+        let first = values.partition_point(|trade| trade.meta.exchange_ts < start);
+        let last = values.partition_point(|trade| trade.meta.exchange_ts < end);
+        &values[first..last]
+    }
+    fn between(&self, market: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> &[&'a Trade] {
+        let Some(values) = self.by_market.get(market) else {
+            return &[];
+        };
+        let first = values.partition_point(|trade| trade.meta.exchange_ts < start);
+        let last = values.partition_point(|trade| trade.meta.exchange_ts <= end);
+        &values[first..last]
+    }
+}
+#[derive(Clone, Copy)]
+struct OutcomeValues {
+    entry: Option<f64>,
+    horizon: Option<f64>,
+    hit: Option<bool>,
+    complete: bool,
+}
+fn outcome_at(
+    signal: &Signal,
+    at: DateTime<Utc>,
+    index: &TradeIndex<'_>,
+    cfg: &Config,
+) -> OutcomeValues {
+    let entry = index.at_or_after(&signal.meta.market, at).filter(|trade| {
+        trade.meta.exchange_ts <= at + Duration::seconds(cfg.validation.entry_max_lag_seconds)
+    });
+    let end = at + Duration::minutes(cfg.validation.horizon_minutes);
+    let horizon = index.at_or_after(&signal.meta.market, end);
     let complete = entry.is_some() && horizon.is_some();
-    let reached_target = entry.map(|entry| {
-        trades
+    let hit = complete.then(|| {
+        let entry_trade = entry.expect("complete has entry");
+        let entry = entry_trade.price;
+        index
+            .between(&signal.meta.market, entry_trade.meta.exchange_ts, end)
             .iter()
-            .filter(|t| {
-                t.meta.market == signal.meta.market
-                    && t.meta.exchange_ts >= signal.meta.exchange_ts
-                    && t.meta.exchange_ts <= end
-            })
             .any(|t| match signal.direction {
                 Side::Buy => (t.price / entry - 1.0) * 100.0 >= cfg.validation.hit_threshold_pct,
                 Side::Sell => (entry / t.price - 1.0) * 100.0 >= cfg.validation.hit_threshold_pct,
             })
     });
+    OutcomeValues {
+        entry: entry.map(|t| t.price),
+        horizon: horizon.map(|t| t.price),
+        hit,
+        complete,
+    }
+}
+pub fn outcome(signal: &Signal, trades: &[Trade], cfg: &Config) -> SignalOutcome {
+    let index = TradeIndex::new(trades);
+    let values = outcome_at(signal, signal.meta.exchange_ts, &index, cfg);
     SignalOutcome {
         signal: signal.clone(),
         rule_key: rule_key(signal),
-        entry_price: entry,
-        horizon_price: horizon,
-        reached_target,
-        complete,
+        entry_price: values.entry,
+        horizon_price: values.horizon,
+        reached_target: values.hit,
+        complete: values.complete,
     }
 }
 
 pub fn build_outcomes(signals: &[Signal], trades: &[Trade], cfg: &Config) -> Vec<SignalOutcome> {
+    let index = TradeIndex::new(trades);
     signals
         .iter()
-        .map(|signal| outcome(signal, trades, cfg))
+        .map(|signal| {
+            let values = outcome_at(signal, signal.meta.exchange_ts, &index, cfg);
+            SignalOutcome {
+                signal: signal.clone(),
+                rule_key: rule_key(signal),
+                entry_price: values.entry,
+                horizon_price: values.horizon,
+                reached_target: values.hit,
+                complete: values.complete,
+            }
+        })
         .collect()
 }
 
@@ -331,43 +468,30 @@ fn seeded(seed: u64, label: &str) -> StdRng {
 
 fn paired_outcomes(
     signals: &[&Signal],
-    trades: &[Trade],
+    index: &TradeIndex<'_>,
     cfg: &Config,
     label: &str,
 ) -> (Vec<bool>, Vec<bool>) {
     let mut rng = seeded(cfg.validation.bootstrap_seed, label);
     let mut hits = Vec::new();
     let mut controls = Vec::new();
-    for signal in signals
-        .iter()
-        .copied()
-        .filter(|s| outcome(s, trades, cfg).complete)
-    {
+    for signal in signals.iter().copied() {
+        let signal_outcome = outcome_at(signal, signal.meta.exchange_ts, index, cfg);
+        if !signal_outcome.complete {
+            continue;
+        }
         // The pool is matched on exactly the signal's market and UTC date.
-        let mut pool: Vec<&Trade> = trades
+        let pool: Vec<&Trade> = index
+            .on_date(&signal.meta.market, signal.meta.exchange_ts.date_naive())
             .iter()
-            .filter(|t| {
-                t.meta.market == signal.meta.market
-                    && t.meta.exchange_ts.date_naive() == signal.meta.exchange_ts.date_naive()
-            })
-            .filter(|t| {
-                let mut control = signal.clone();
-                control.meta.exchange_ts = t.meta.exchange_ts;
-                control.meta.receive_ts = t.meta.receive_ts;
-                outcome(&control, trades, cfg).complete
-            })
+            .copied()
+            .filter(|t| outcome_at(signal, t.meta.exchange_ts, index, cfg).complete)
             .collect();
-        pool.sort_by_key(|trade| {
-            serde_json::to_string(trade).expect("trade serializes for deterministic controls")
-        });
         if let Some(t) = (!pool.is_empty()).then(|| pool[rng.random_range(0..pool.len())]) {
-            let mut control = signal.clone();
-            control.meta.exchange_ts = t.meta.exchange_ts;
-            control.meta.receive_ts = t.meta.receive_ts;
-            hits.push(outcome(signal, trades, cfg).reached_target.unwrap_or(false));
+            hits.push(signal_outcome.hit.unwrap_or(false));
             controls.push(
-                outcome(&control, trades, cfg)
-                    .reached_target
+                outcome_at(signal, t.meta.exchange_ts, index, cfg)
+                    .hit
                     .unwrap_or(false),
             );
         }
@@ -403,48 +527,12 @@ pub fn evaluate_with_audit(
     books: &[Orderbook],
     cfg: &Config,
 ) -> Result<EvaluationAudit> {
-    let required = cfg.validation.tuning_days + cfg.validation.validation_days;
-    if cfg.validation.tuning_days == 0 || cfg.validation.validation_days == 0 {
-        bail!("tuning_days and validation_days must both be greater than zero");
-    }
     if cfg.validation.bootstrap_iterations == 0 {
         bail!("bootstrap_iterations must be greater than zero");
     }
-    let dates: BTreeSet<NaiveDate> = trades
-        .iter()
-        .map(|t| t.meta.exchange_ts.date_naive())
-        .chain(books.iter().map(|b| b.meta.exchange_ts.date_naive()))
-        .collect();
-    if dates.is_empty() {
-        bail!("need {required} UTC collection dates, found none");
-    }
-    let end = *dates.iter().next_back().expect("checked non-empty");
-    let start = end - Duration::days((required - 1) as i64);
-    let expected: Vec<_> = (0..required)
-        .map(|i| start + Duration::days(i as i64))
-        .collect();
-    let missing: Vec<_> = expected.iter().filter(|d| !dates.contains(d)).collect();
-    if !missing.is_empty() {
-        bail!(
-            "missing UTC collection dates: {}",
-            missing
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if dates.len() < required {
-        bail!(
-            "need {required} UTC collection dates, found {} ({})",
-            dates.len(),
-            dates
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    let expected = current_collection_dates(trades, books, cfg)?;
+    let start = *expected.first().expect("validated non-empty");
+    let end = *expected.last().expect("validated non-empty");
     let tuning_end = start + Duration::days((cfg.validation.tuning_days - 1) as i64);
     let validation_start = tuning_end + Duration::days(1);
     let mut candidates: BTreeMap<String, Vec<&Signal>> = BTreeMap::new();
@@ -463,7 +551,8 @@ pub fn evaluate_with_audit(
             .copied()
             .filter(|s| s.meta.exchange_ts.date_naive() <= tuning_end)
             .collect();
-        let (hits, controls) = paired_outcomes(&train, trades, cfg, &format!("train:{id}"));
+        let index = TradeIndex::new(trades);
+        let (hits, controls) = paired_outcomes(&train, &index, cfg, &format!("train:{id}"));
         let key = candidate.first().expect("non-empty").signal_type.clone();
         let replace = selected
             .get(&key)
@@ -496,7 +585,7 @@ pub fn evaluate_with_audit(
                 .collect();
             let (hits, controls) = paired_outcomes(
                 &validation,
-                trades,
+                &TradeIndex::new(trades),
                 cfg,
                 &format!("validation:{}", selected.id),
             );
@@ -546,19 +635,19 @@ pub fn paper(
     passed: &[String],
     cfg: &Config,
 ) -> Vec<crate::model::PaperTrade> {
-    let mut ordered_trades = trades.to_vec();
-    ordered_trades.sort_by_key(|trade| serde_json::to_string(trade).expect("trade serializes"));
+    let index = TradeIndex::new(trades);
     signals
         .iter()
         .filter(|s| passed.contains(&format!("{}:{}", s.signal_type, s.rule_id)))
         .filter_map(|s| {
-            let e = ordered_trades.iter().find(|t| {
-                t.meta.market == s.meta.market && t.meta.exchange_ts >= s.meta.exchange_ts
-            })?;
-            let x = ordered_trades.iter().find(|t| {
-                t.meta.market == s.meta.market
-                    && t.meta.exchange_ts >= s.meta.exchange_ts + Duration::minutes(15)
-            })?;
+            let e = index.at_or_after(&s.meta.market, s.meta.exchange_ts)?;
+            if e.meta.exchange_ts
+                > s.meta.exchange_ts + Duration::seconds(cfg.validation.entry_max_lag_seconds)
+            {
+                return None;
+            }
+            let x =
+                index.at_or_after(&s.meta.market, s.meta.exchange_ts + Duration::minutes(15))?;
             let g = match s.direction {
                 Side::Buy => (x.price / e.price - 1.0) * 100.0,
                 Side::Sell => (e.price / x.price - 1.0) * 100.0,
@@ -569,7 +658,7 @@ pub fn paper(
                 exit_price: x.price,
                 gross_pnl_pct: g,
                 net_pnl_pct: g - 2.0 * (cfg.paper.fee_bps + cfg.paper.slippage_bps) / 100.0,
-                benchmark_pnl_pct: (x.price / e.price - 1.0) * 100.0,
+                long_only_benchmark_pnl_pct: (x.price / e.price - 1.0) * 100.0,
             })
         })
         .collect()

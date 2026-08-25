@@ -140,6 +140,7 @@ fn outcome_marks_incomplete_horizons_without_counting_a_hit() {
     assert!(!outcome.complete);
     assert_eq!(outcome.entry_price, Some(100.));
     assert_eq!(outcome.horizon_price, None);
+    assert_eq!(outcome.reached_target, None);
     assert_eq!(outcome.rule_key, "synthetic:only");
 }
 
@@ -373,7 +374,7 @@ fn trade_rate_signal_fires_on_crossing_and_rearms_after_eviction() {
 }
 
 #[test]
-fn retain_markets_drops_removed_market_state() {
+fn reset_drops_removed_market_state() {
     let cfg = Config {
         wall_min_krw: 100.,
         ..Default::default()
@@ -391,7 +392,7 @@ fn retain_markets_drops_removed_market_state() {
         }],
     };
     detector.on_orderbook(&wall);
-    detector.retain_markets(&["KRW-OTHER".into()]);
+    detector.reset();
     let low = Orderbook {
         meta: meta(2_000),
         total_ask_size: 1.,
@@ -497,6 +498,41 @@ fn paper_only_uses_the_validation_qualified_signal_type_and_rule() {
 
     assert_eq!(paper.len(), 1);
     assert_eq!(paper[0].signal.signal_type, "qualified");
+}
+
+#[test]
+fn entry_after_deadline_is_incomplete_even_if_horizon_exists() {
+    let cfg = Config::default();
+    let signal = candidate(0, 0, "deadline");
+    let trades = vec![dated_trade(0, 2, 100.), dated_trade(0, 15, 101.)];
+    let outcome = analysis::outcome(&signal, &trades, &cfg);
+    assert!(!outcome.complete);
+    assert_eq!(outcome.entry_price, None);
+    assert_eq!(outcome.reached_target, None);
+}
+
+#[test]
+fn exact_timestamp_entries_use_the_explicit_sequence_tiebreaker() {
+    let cfg = Config::default();
+    let signal = candidate(0, 0, "tie");
+    let mut first = dated_trade(0, 0, 100.);
+    first.sequential_id = Some(1);
+    let mut second = dated_trade(0, 0, 200.);
+    second.sequential_id = Some(2);
+    let horizon = dated_trade(0, 15, 110.);
+    let outcome = analysis::outcome(&signal, &[second, horizon, first], &cfg);
+    assert_eq!(outcome.entry_price, Some(100.));
+}
+
+#[test]
+fn sell_paper_trade_uses_a_long_only_benchmark() {
+    let cfg = Config::default();
+    let mut signal = candidate(0, 0, "sell");
+    signal.direction = Side::Sell;
+    let trades = vec![dated_trade(0, 0, 100.), dated_trade(0, 15, 90.)];
+    let paper = analysis::paper(&[signal], &trades, &["synthetic:sell".into()], &cfg);
+    assert!((paper[0].long_only_benchmark_pnl_pct + 10.).abs() < 1e-9);
+    assert!(paper[0].gross_pnl_pct > 0.);
 }
 
 fn dated_meta(day: i64, minute: i64) -> Meta {
