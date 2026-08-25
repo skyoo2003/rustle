@@ -26,9 +26,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
-arrow-array = "53"
-arrow-schema = "53"
-parquet = { version = "53", features = ["arrow"] }
+arrow-array = "59"
+arrow-schema = "59"
+# 59 is the first parquet release that drops the `thrift` dependency, which is
+# how CVE-2026-43868 (thrift 0.17, no patch below 0.23) reached this tree.
+parquet = { version = "59", features = ["arrow"] }
 
 [dev-dependencies]
 tempfile = "3"
