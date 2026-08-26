@@ -496,8 +496,9 @@ fn build_signals_is_deterministic_when_inputs_are_reordered() {
     );
 }
 #[test]
-fn paper_exit_is_first_trade_at_or_after_fifteen_minutes() {
-    let cfg = Config::default();
+fn paper_exit_is_the_first_trade_at_or_after_the_validated_horizon() {
+    let mut cfg = Config::default();
+    cfg.validation.horizon_minutes = 30;
     let signal = rustle::model::Signal {
         meta: meta(0),
         signal_type: "x".into(),
@@ -508,24 +509,19 @@ fn paper_exit_is_first_trade_at_or_after_fifteen_minutes() {
         market_snapshot: serde_json::json!({}),
         rule_id: "ok".into(),
     };
-    let tr = vec![
-        Trade {
-            meta: meta(0),
-            price: 100.,
-            volume: 1.,
-            side: Side::Buy,
-            sequential_id: None,
-        },
-        Trade {
-            meta: meta(Duration::minutes(15).num_milliseconds()),
-            price: 110.,
-            volume: 1.,
-            side: Side::Buy,
-            sequential_id: None,
-        },
-    ];
+    let at = |minutes: i64, price: f64| Trade {
+        meta: meta(Duration::minutes(minutes).num_milliseconds()),
+        price,
+        volume: 1.,
+        side: Side::Buy,
+        sequential_id: None,
+    };
+    let tr = vec![at(0, 100.), at(15, 110.), at(30, 120.)];
     let p = analysis::paper(&[signal], &tr, &["x:ok".into()], &cfg);
-    assert_eq!(p[0].exit_price, 110.);
+    assert_eq!(
+        p[0].exit_price, 120.,
+        "paper must hold for validation.horizon_minutes, not a hardcoded 15"
+    );
 }
 
 #[test]
