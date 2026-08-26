@@ -56,7 +56,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    Paper,
+    /// Replay the qualified ruleset over its validation window against an equal-weight hold.
+    Paper {
+        #[arg(long)]
+        csv: bool,
+    },
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -75,7 +79,7 @@ async fn main() -> Result<()> {
                 Command::Report { csv } => report(&cfg, csv),
                 Command::Coverage { csv } => coverage(&cfg, csv),
                 Command::Alert { json } => alert(&cfg, json),
-                Command::Paper => paper(&cfg),
+                Command::Paper { csv } => paper(&cfg, csv),
                 _ => unreachable!(),
             }
         }
@@ -715,7 +719,7 @@ fn coverage(cfg: &Config, csv: bool) -> Result<()> {
     Ok(())
 }
 
-fn paper(cfg: &Config) -> Result<()> {
+fn paper(cfg: &Config, csv: bool) -> Result<()> {
     cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
     let set = load_fresh_ruleset(&root, cfg)?;
@@ -752,13 +756,11 @@ fn paper(cfg: &Config) -> Result<()> {
         report.summary.generated_at,
         std::slice::from_ref(&report.summary),
     )?;
-    println!(
-        "simulated {} paper trades; net {:.3}%, hold {:.3}%, excess {:+.3}pp",
-        report.summary.trade_count,
-        report.summary.cumulative_net_pnl_pct,
-        report.summary.hodl_pnl_pct,
-        report.summary.excess_pnl_pct
-    );
+    if csv {
+        print!("{}", analysis::render_paper_csv(&report));
+    } else {
+        print!("{}", analysis::render_paper_markdown(&report)?);
+    }
     Ok(())
 }
 

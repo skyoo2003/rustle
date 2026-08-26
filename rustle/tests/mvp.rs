@@ -706,6 +706,137 @@ fn a_signal_whose_horizon_runs_past_the_last_trade_is_counted_not_traded() {
     assert_eq!(report.summary.cumulative_net_pnl_pct, 0.0);
 }
 
+/// Four contiguous UTC dates on one market. Three times a day the book goes bid-heavy and
+/// the price steps up 1% fifteen minutes later, then sits flat; every other moment is quiet,
+/// so a matched-random entry almost never hits and one rule can clear the gate.
+fn gated_fixture(root: &std::path::Path) {
+    let market = "KRW-A";
+    for day in 0..4 {
+        let mut trades = Vec::new();
+        let mut books = Vec::new();
+        for event in 0..3 {
+            let at = event * 120;
+            let book = |minute: i64, bid: f64, ask: f64| Orderbook {
+                meta: market_meta(market, day, minute),
+                total_ask_size: ask,
+                total_bid_size: bid,
+                levels: vec![],
+            };
+            books.push(book(at, 9.0, 1.0));
+            books.push(book(at + 1, 5.0, 5.0));
+            trades.push(market_trade(market, day, at, 100.0));
+            trades.push(market_trade(market, day, at + 15, 101.0));
+            for flat in (20..120).step_by(5) {
+                trades.push(market_trade(market, day, at + flat as i64, 101.0));
+            }
+        }
+        let at = market_meta(market, day, 0).exchange_ts;
+        storage::write(root, "trades", market, at, &trades).unwrap();
+        storage::write(root, "orderbooks", market, at, &books).unwrap();
+    }
+}
+
+fn gated_config(data_root: &std::path::Path) -> Config {
+    let mut cfg = Config {
+        data_root: data_root.display().to_string(),
+        ..Config::default()
+    };
+    // One candidate rule keeps the fixture's family size at one; the other detectors are
+    // switched off so the only signals are the book imbalances the fixture stages.
+    cfg.candidate.imbalance_thresholds = vec![0.4];
+    cfg.candidate.large_trade_multiples = vec![];
+    cfg.candidate.trade_rate_multiples = vec![];
+    cfg.validation.tuning_days = 2;
+    cfg.validation.validation_days = 2;
+    cfg.validation.min_validation_signals = 1;
+    cfg.validation.bootstrap_iterations = 200;
+    cfg
+}
+
+fn run_cli(config_path: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_rustle"))
+        .args(args)
+        .args(["--config"])
+        .arg(config_path)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn paper_output_stays_blocked_until_a_qualified_ruleset_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("rustle.toml");
+    let cfg = Config {
+        data_root: dir.path().join("data").display().to_string(),
+        ..Config::default()
+    };
+    std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+
+    for args in [&["paper"][..], &["paper", "--csv"][..]] {
+        let output = run_cli(&config_path, args);
+        assert!(!output.status.success(), "{args:?} must not report a P&L");
+        assert!(String::from_utf8(output.stdout).unwrap().is_empty());
+        assert!(String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("no persisted ruleset"));
+    }
+}
+
+#[test]
+fn a_passed_gate_yields_a_windowed_paper_report_ending_in_a_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("rustle.toml");
+    let cfg = gated_config(&dir.path().join("data"));
+    std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+    gated_fixture(&dir.path().join("data"));
+
+    let analyze = run_cli(&config_path, &["analyze"]);
+    assert!(analyze.status.success(), "{:?}", analyze);
+    let report = run_cli(&config_path, &["report"]);
+    assert!(
+        String::from_utf8(report.stdout)
+            .unwrap()
+            .contains("GATE: PASS"),
+        "the fixture must clear the gate for this test to mean anything"
+    );
+
+    let markdown = run_cli(&config_path, &["paper"]);
+    assert!(markdown.status.success(), "{markdown:?}");
+    let markdown = String::from_utf8(markdown.stdout).unwrap();
+    // Days 1-2 tuned the rule; only days 3-4 are simulated.
+    assert!(
+        markdown.contains("Window: 2025-01-03–2025-01-04 (validation only) · 1 market ·"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("| KRW-A |"), "{markdown}");
+    let verdict = markdown.lines().last().unwrap().to_owned();
+    assert!(
+        verdict.starts_with("VERDICT: STRATEGY WINS by "),
+        "six compounded +0.84% trades must beat a +0.84% hold: {verdict}"
+    );
+    assert!(
+        verdict.ends_with(" over 2025-01-03–2025-01-04"),
+        "{verdict}"
+    );
+
+    let csv = run_cli(&config_path, &["paper", "--csv"]);
+    assert!(csv.status.success(), "{csv:?}");
+    let csv = String::from_utf8(csv.stdout).unwrap();
+    assert!(csv.starts_with("section,key,trades,"), "{csv}");
+    assert!(csv.lines().any(|line| line.starts_with("market,KRW-A,")));
+    assert_eq!(csv.lines().last(), Some(verdict.as_str()));
+
+    let summaries: Vec<rustle::model::PaperSummary> =
+        storage::read_all(&dir.path().join("data"), "paper_summaries").unwrap();
+    assert_eq!(summaries.len(), 1, "the derived dataset is cleared per run");
+    assert_eq!(
+        summaries[0].window_start,
+        Some(NaiveDate::from_ymd_opt(2025, 1, 3).unwrap())
+    );
+    assert_eq!(summaries[0].market_count, 1);
+    assert!(summaries[0].excess_pnl_pct > 0.0);
+}
+
 #[test]
 fn entry_after_deadline_is_incomplete_even_if_horizon_exists() {
     let cfg = Config::default();

@@ -1411,6 +1411,159 @@ fn max_drawdown_pct(closes: &[(DateTime<Utc>, String, f64)], universe: &[(&str, 
     worst
 }
 
+/// The universe refreshes daily to the top markets by volume, so a market that fell out
+/// is absent from later dates.  That biases the hold benchmark upward, which makes the
+/// verdict conservative in the strategy's favour — and belongs in the report, not a footnote
+/// in a document nobody opens.
+const SURVIVORSHIP_CAVEAT: &str = "The market universe refreshes daily to the top markets by volume, so markets that fell\nout of it are absent from later dates. That survivorship bias favours hold: beating this\nbenchmark is a stronger result than the raw gap suggests, and losing to it a weaker one.";
+
+/// The milestone's single number, stated so the reader does not have to do the subtraction.
+fn paper_verdict(report: &PaperReport) -> String {
+    let (start, end) = report.window;
+    let excess = report.summary.excess_pnl_pct;
+    match excess.partial_cmp(&0.0) {
+        Some(Ordering::Greater) => {
+            format!("VERDICT: STRATEGY WINS by {excess:.3}pp over {start}–{end}")
+        }
+        Some(Ordering::Less) => {
+            format!("VERDICT: HOLD WINS by {:.3}pp over {start}–{end}", -excess)
+        }
+        _ => format!("VERDICT: TIE at 0.000pp over {start}–{end}"),
+    }
+}
+
+/// Trade-weighted mean across rules, which is total net divided by total trades without
+/// carrying a second copy of either.
+fn mean_across_rules(report: &PaperReport) -> f64 {
+    let trades: usize = report.rules.iter().map(|rule| rule.trade_count).sum();
+    let total: f64 = report
+        .rules
+        .iter()
+        .map(|rule| rule.mean_pnl_pct * rule.trade_count as f64)
+        .sum();
+    total / trades.max(1) as f64
+}
+
+pub fn render_paper_markdown(report: &PaperReport) -> Result<String> {
+    let summary = &report.summary;
+    let (start, end) = report.window;
+    let markets = format!(
+        "{} market{}",
+        summary.market_count,
+        if summary.market_count == 1 { "" } else { "s" }
+    );
+    let mut output = String::from("# Rustle paper study\n\n");
+    writeln!(
+        output,
+        "Window: {}–{} (validation only) · {} · horizon {}m · fees {}bps, slippage {}bps\n",
+        start, end, markets, report.horizon_minutes, report.fee_bps, report.slippage_bps,
+    )
+    .expect("writing to String cannot fail");
+
+    output.push_str("| Rule | Trades | Skipped (overlap) | Incomplete | Win rate | Net P&L | Mean / trade |\n|---|---:|---:|---:|---:|---:|---:|\n");
+    for rule in &report.rules {
+        writeln!(
+            output,
+            "| {} | {} | {} | {} | {:.1}% | {:+.3}% | {:+.3}% |",
+            rule.rule_key,
+            rule.trade_count,
+            rule.skipped_overlapping,
+            rule.incomplete_horizon,
+            rule.win_rate * 100.0,
+            rule.net_pnl_pct,
+            rule.mean_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+
+    output.push_str("\n| Market | Trades | Net P&L | Hold P&L |\n|---|---:|---:|---:|\n");
+    for market in &report.markets {
+        writeln!(
+            output,
+            "| {} | {} | {:+.3}% | {:+.3}% |",
+            market.market, market.trade_count, market.net_pnl_pct, market.hodl_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+
+    if summary.trade_count == 0 {
+        output.push_str("\nNo qualified signal produced a paper trade in this window.\n");
+    }
+    writeln!(
+        output,
+        "\nStrategy: {:+.3}% net, max drawdown {:.3}%, {} trades, {} skipped for overlap, {} incomplete.",
+        summary.cumulative_net_pnl_pct,
+        summary.max_drawdown_pct,
+        summary.trade_count,
+        summary.skipped_overlapping,
+        summary.incomplete_horizon,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "Hold:     {:+.3}% (equal weight over the same {}, one round trip).\n",
+        summary.hodl_pnl_pct, markets,
+    )
+    .expect("writing to String cannot fail");
+    output.push_str(SURVIVORSHIP_CAVEAT);
+    writeln!(output, "\n\n{}", paper_verdict(report)).expect("writing to String cannot fail");
+    Ok(output)
+}
+
+pub fn render_paper_csv(report: &PaperReport) -> String {
+    let summary = &report.summary;
+    let mut output = String::from(
+        "section,key,trades,skipped_overlapping,incomplete_horizon,win_rate,net_pnl_pct,mean_pnl_pct,max_drawdown_pct,hodl_pnl_pct\n",
+    );
+    for rule in &report.rules {
+        // A rule has no hold benchmark: you cannot hold a rule, only the markets it traded.
+        writeln!(
+            output,
+            "rule,{},{},{},{},{:.4},{:.4},{:.4},,",
+            rule.rule_key,
+            rule.trade_count,
+            rule.skipped_overlapping,
+            rule.incomplete_horizon,
+            rule.win_rate,
+            rule.net_pnl_pct,
+            rule.mean_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+    for market in &report.markets {
+        writeln!(
+            output,
+            "market,{},{},{},{},{:.4},{:.4},{:.4},,{:.4}",
+            market.market,
+            market.trade_count,
+            market.skipped_overlapping,
+            market.incomplete_horizon,
+            market.win_rate,
+            market.net_pnl_pct,
+            market.mean_pnl_pct,
+            market.hodl_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+    writeln!(
+        output,
+        "total,ALL,{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
+        summary.trade_count,
+        summary.skipped_overlapping,
+        summary.incomplete_horizon,
+        summary.win_rate,
+        summary.cumulative_net_pnl_pct,
+        mean_across_rules(report),
+        summary.max_drawdown_pct,
+        summary.hodl_pnl_pct,
+    )
+    .expect("writing to String cannot fail");
+    // The verdict is the deliverable, so it trails the rows here exactly as it ends the
+    // Markdown report. Consumers already have to read the `section` column.
+    writeln!(output, "{}", paper_verdict(report)).expect("writing to String cannot fail");
+    output
+}
+
 #[cfg(test)]
 mod milestone_four_tests {
     use super::*;
@@ -1502,9 +1655,18 @@ mod milestone_four_tests {
             lines.next(),
             Some("section,key,trades,skipped_overlapping,incomplete_horizon,win_rate,net_pnl_pct,mean_pnl_pct,max_drawdown_pct,hodl_pnl_pct")
         );
-        assert_eq!(lines.next(), Some("rule,synthetic:a,3,1,2,0.6667,1.5000,0.5000,,"));
-        assert_eq!(lines.next(), Some("market,KRW-A,2,0,1,1.0000,1.0000,0.5000,,3.0000"));
-        assert_eq!(lines.next(), Some("market,KRW-B,1,1,1,0.0000,0.5000,0.5000,,1.0000"));
+        assert_eq!(
+            lines.next(),
+            Some("rule,synthetic:a,3,1,2,0.6667,1.5000,0.5000,,")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("market,KRW-A,2,0,1,1.0000,1.0000,0.5000,,3.0000")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("market,KRW-B,1,1,1,0.0000,0.5000,0.5000,,1.0000")
+        );
         assert_eq!(
             lines.next(),
             Some("total,ALL,3,1,2,0.6667,0.7500,0.5000,-1.2000,2.0000")
@@ -1522,7 +1684,10 @@ mod milestone_four_tests {
         report.summary.excess_pnl_pct = 1.5;
 
         let winner = Some("VERDICT: STRATEGY WINS by 1.500pp over 2025-01-15–2025-01-28");
-        assert_eq!(render_paper_markdown(&report).unwrap().lines().last(), winner);
+        assert_eq!(
+            render_paper_markdown(&report).unwrap().lines().last(),
+            winner
+        );
         assert_eq!(render_paper_csv(&report).lines().last(), winner);
 
         report.summary.excess_pnl_pct = 0.0;
@@ -1560,7 +1725,10 @@ mod milestone_four_tests {
 
         let csv = render_paper_csv(&report);
         assert!(!csv.contains("NaN"), "{csv}");
-        assert_eq!(csv.lines().filter(|line| line.starts_with("rule,")).count(), 0);
+        assert_eq!(
+            csv.lines().filter(|line| line.starts_with("rule,")).count(),
+            0
+        );
         assert_eq!(
             csv.lines().last(),
             Some("VERDICT: HOLD WINS by 2.000pp over 2025-01-15–2025-01-28")
