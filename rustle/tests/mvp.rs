@@ -120,7 +120,7 @@ fn wall_cancel_signal_has_evidence() {
             ask_size: 1.,
         }],
     };
-    let s = analysis::build_signals(vec![], vec![a, b], &cfg);
+    let s = analysis::build_signals(&[], &[a, b], &cfg);
     let w = s
         .iter()
         .find(|x| x.signal_type == "wall_disappearance")
@@ -475,10 +475,10 @@ fn build_signals_is_deterministic_when_inputs_are_reordered() {
     reverse_books.reverse();
 
     assert_eq!(
-        serde_json::to_string(&analysis::build_signals(trades, books, &cfg)).unwrap(),
+        serde_json::to_string(&analysis::build_signals(&trades, &books, &cfg)).unwrap(),
         serde_json::to_string(&analysis::build_signals(
-            reverse_trades,
-            reverse_books,
+            &reverse_trades,
+            &reverse_books,
             &cfg
         ))
         .unwrap()
@@ -623,7 +623,13 @@ fn twenty_eight_days_of_trades() -> Vec<Trade> {
 fn evaluation_requires_contiguous_utc_collection_dates() {
     let mut trades = twenty_eight_days_of_trades();
     trades.retain(|t| t.meta.exchange_ts.date_naive() != dated_meta(8, 0).exchange_ts.date_naive());
-    let err = analysis::evaluate_with_audit(&[], &trades, &[], &Config::default()).unwrap_err();
+    let err = analysis::evaluate_with_audit(
+        &[],
+        &trades,
+        &std::collections::BTreeSet::new(),
+        &Config::default(),
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("missing UTC collection dates"));
 }
 
@@ -642,13 +648,44 @@ fn tuning_selects_one_rule_without_using_validation_and_is_reproducible() {
     // This is after the final observed horizon and must not count as validation evidence.
     signals.push(candidate(27, 30, "b"));
     let cfg = Config::default();
-    let first = analysis::evaluate_with_audit(&signals, &trades, &[], &cfg).unwrap();
-    let second = analysis::evaluate_with_audit(&signals, &trades, &[], &cfg).unwrap();
+    let first =
+        analysis::evaluate_with_audit(&signals, &trades, &std::collections::BTreeSet::new(), &cfg)
+            .unwrap();
+    let second =
+        analysis::evaluate_with_audit(&signals, &trades, &std::collections::BTreeSet::new(), &cfg)
+            .unwrap();
+    let mut uncorrected_cfg = cfg.clone();
+    uncorrected_cfg.validation.family_wise_correction = false;
+    let uncorrected = analysis::evaluate_with_audit(
+        &signals,
+        &trades,
+        &std::collections::BTreeSet::new(),
+        &uncorrected_cfg,
+    )
+    .unwrap();
     assert_eq!(
         serde_json::to_string(&first).unwrap(),
         serde_json::to_string(&second).unwrap()
     );
+    assert_eq!(
+        serde_json::to_string(&first.results).unwrap(),
+        serde_json::to_string(&uncorrected.results).unwrap(),
+        "one-family results retain the uncorrected interval"
+    );
     assert_eq!(first.results.len(), 1);
+    assert_eq!(first.candidates.len(), 2);
+    assert_eq!(
+        first
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.selected)
+            .count(),
+        1
+    );
+    assert!(first
+        .candidates
+        .iter()
+        .any(|candidate| candidate.rule_id == "synthetic:a" && !candidate.selected));
     let selected = &first.results[0];
     assert_eq!(selected.rule_id, "synthetic:b");
     assert_eq!(selected.validation_count, 14);
