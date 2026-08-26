@@ -971,6 +971,14 @@ mod tests {
     }
 
     #[test]
+    fn paper_csv_flag_parses_like_its_sibling_commands() {
+        let cli = Cli::try_parse_from(["rustle", "paper", "--csv"]).unwrap();
+        assert!(matches!(cli.command, Command::Paper { csv: true }));
+        let plain = Cli::try_parse_from(["rustle", "paper"]).unwrap();
+        assert!(matches!(plain.command, Command::Paper { csv: false }));
+    }
+
+    #[test]
     fn flush_keeps_live_signals_separate_and_partitions_by_utc_date() {
         let dir = tempfile::tempdir().unwrap();
         let mut trades = vec![

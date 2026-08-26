@@ -1412,6 +1412,163 @@ fn max_drawdown_pct(closes: &[(DateTime<Utc>, String, f64)], universe: &[(&str, 
 }
 
 #[cfg(test)]
+mod milestone_four_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn paper_fixture() -> PaperReport {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 1, 28).unwrap();
+        PaperReport {
+            summary: crate::model::PaperSummary {
+                generated_at: Utc.with_ymd_and_hms(2025, 1, 29, 0, 0, 0).unwrap(),
+                trade_count: 3,
+                cumulative_net_pnl_pct: 0.75,
+                win_rate: 2.0 / 3.0,
+                window_start: Some(start),
+                window_end: Some(end),
+                market_count: 2,
+                skipped_overlapping: 1,
+                incomplete_horizon: 2,
+                max_drawdown_pct: -1.2,
+                hodl_pnl_pct: 2.0,
+                excess_pnl_pct: -1.25,
+            },
+            trades: vec![],
+            rules: vec![PaperRuleRow {
+                rule_key: "synthetic:a".into(),
+                trade_count: 3,
+                skipped_overlapping: 1,
+                incomplete_horizon: 2,
+                win_rate: 2.0 / 3.0,
+                net_pnl_pct: 1.5,
+                mean_pnl_pct: 0.5,
+            }],
+            markets: vec![
+                PaperMarketRow {
+                    market: "KRW-A".into(),
+                    trade_count: 2,
+                    skipped_overlapping: 0,
+                    incomplete_horizon: 1,
+                    win_rate: 1.0,
+                    net_pnl_pct: 1.0,
+                    mean_pnl_pct: 0.5,
+                    hodl_pnl_pct: 3.0,
+                },
+                PaperMarketRow {
+                    market: "KRW-B".into(),
+                    trade_count: 1,
+                    skipped_overlapping: 1,
+                    incomplete_horizon: 1,
+                    win_rate: 0.0,
+                    net_pnl_pct: 0.5,
+                    mean_pnl_pct: 0.5,
+                    hodl_pnl_pct: 1.0,
+                },
+            ],
+            window: (start, end),
+            horizon_minutes: 15,
+            fee_bps: 5.0,
+            slippage_bps: 3.0,
+        }
+    }
+
+    #[test]
+    fn paper_report_renders_both_tables_and_ends_in_an_explicit_verdict() {
+        let report = paper_fixture();
+
+        let markdown = render_paper_markdown(&report).unwrap();
+        assert!(markdown.contains(
+            "Window: 2025-01-15–2025-01-28 (validation only) · 2 markets · horizon 15m · fees 5bps, slippage 3bps"
+        ));
+        assert!(markdown.contains("| synthetic:a | 3 | 1 | 2 | 66.7% | +1.500% | +0.500% |"));
+        assert!(markdown.contains("| KRW-A | 2 | +1.000% | +3.000% |"));
+        assert!(markdown.contains(
+            "Strategy: +0.750% net, max drawdown -1.200%, 3 trades, 1 skipped for overlap, 2 incomplete."
+        ));
+        assert!(markdown.contains("Hold:     +2.000%"));
+        assert!(
+            markdown.contains("survivorship"),
+            "the hold benchmark's bias belongs in the report, not only in the ADR"
+        );
+        assert_eq!(
+            markdown.lines().last(),
+            Some("VERDICT: HOLD WINS by 1.250pp over 2025-01-15–2025-01-28")
+        );
+
+        let csv = render_paper_csv(&report);
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some("section,key,trades,skipped_overlapping,incomplete_horizon,win_rate,net_pnl_pct,mean_pnl_pct,max_drawdown_pct,hodl_pnl_pct")
+        );
+        assert_eq!(lines.next(), Some("rule,synthetic:a,3,1,2,0.6667,1.5000,0.5000,,"));
+        assert_eq!(lines.next(), Some("market,KRW-A,2,0,1,1.0000,1.0000,0.5000,,3.0000"));
+        assert_eq!(lines.next(), Some("market,KRW-B,1,1,1,0.0000,0.5000,0.5000,,1.0000"));
+        assert_eq!(
+            lines.next(),
+            Some("total,ALL,3,1,2,0.6667,0.7500,0.5000,-1.2000,2.0000")
+        );
+        assert_eq!(
+            csv.lines().last(),
+            Some("VERDICT: HOLD WINS by 1.250pp over 2025-01-15–2025-01-28")
+        );
+    }
+
+    #[test]
+    fn the_verdict_names_the_winner_in_both_directions_and_calls_a_tie_a_tie() {
+        let mut report = paper_fixture();
+        report.summary.cumulative_net_pnl_pct = 3.5;
+        report.summary.excess_pnl_pct = 1.5;
+
+        let winner = Some("VERDICT: STRATEGY WINS by 1.500pp over 2025-01-15–2025-01-28");
+        assert_eq!(render_paper_markdown(&report).unwrap().lines().last(), winner);
+        assert_eq!(render_paper_csv(&report).lines().last(), winner);
+
+        report.summary.excess_pnl_pct = 0.0;
+        assert_eq!(
+            render_paper_markdown(&report).unwrap().lines().last(),
+            Some("VERDICT: TIE at 0.000pp over 2025-01-15–2025-01-28")
+        );
+    }
+
+    #[test]
+    fn a_paper_study_with_no_trades_renders_its_tables_and_says_so() {
+        let mut report = paper_fixture();
+        report.summary.trade_count = 0;
+        report.summary.win_rate = 0.0;
+        report.summary.cumulative_net_pnl_pct = 0.0;
+        report.summary.max_drawdown_pct = 0.0;
+        report.summary.excess_pnl_pct = -report.summary.hodl_pnl_pct;
+        report.rules.clear();
+        for market in &mut report.markets {
+            market.trade_count = 0;
+            market.win_rate = 0.0;
+            market.net_pnl_pct = 0.0;
+            market.mean_pnl_pct = 0.0;
+        }
+
+        let markdown = render_paper_markdown(&report).unwrap();
+        assert!(markdown.contains("| Rule | Trades |"));
+        assert!(markdown.contains("| Market | Trades |"));
+        assert!(markdown.contains("No qualified signal produced a paper trade in this window."));
+        assert!(!markdown.contains("NaN"), "{markdown}");
+        assert_eq!(
+            markdown.lines().last(),
+            Some("VERDICT: HOLD WINS by 2.000pp over 2025-01-15–2025-01-28")
+        );
+
+        let csv = render_paper_csv(&report);
+        assert!(!csv.contains("NaN"), "{csv}");
+        assert_eq!(csv.lines().filter(|line| line.starts_with("rule,")).count(), 0);
+        assert_eq!(
+            csv.lines().last(),
+            Some("VERDICT: HOLD WINS by 2.000pp over 2025-01-15–2025-01-28")
+        );
+    }
+}
+
+#[cfg(test)]
 mod coverage_tests {
     use super::*;
     use crate::model::{ConnectionEvent, Level, SCHEMA_VERSION};
