@@ -46,6 +46,10 @@ enum Command {
         #[arg(long)]
         csv: bool,
     },
+    Coverage {
+        #[arg(long)]
+        csv: bool,
+    },
     /// Print explainable alerts only for rules that passed validation.
     Alert,
     Paper,
@@ -65,6 +69,7 @@ async fn main() -> Result<()> {
                 Command::Collect { once, emit_alerts } => collect(&cfg, once, emit_alerts).await,
                 Command::Analyze => analyze(&cfg),
                 Command::Report { csv } => report(&cfg, csv),
+                Command::Coverage { csv } => coverage(&cfg, csv),
                 Command::Alert => alert(&cfg),
                 Command::Paper => paper(&cfg),
                 _ => unreachable!(),
@@ -73,6 +78,7 @@ async fn main() -> Result<()> {
     }
 }
 async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
+    cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
     let mut markets = upbit::top_krw_markets(cfg.top_market_count).await?;
     let now = Utc::now();
@@ -161,11 +167,42 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                 let mut ts = Vec::new();
                 let mut bs = Vec::new();
                 let mut ss = Vec::new();
+                let flush_period = Duration::from_secs(cfg.flush_interval_seconds as u64);
+                let stall_period = Duration::from_secs(cfg.stall_timeout_seconds as u64);
+                let mut flush_ticker = tokio::time::interval_at(
+                    tokio::time::Instant::now() + flush_period,
+                    flush_period,
+                );
+                let stall_deadline = tokio::time::sleep(stall_period);
+                tokio::pin!(stall_deadline);
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => { flush(&root, &mut ts, &mut bs, &mut ss)?; return Ok(()); }
+                        maintenance = next_maintenance(&mut flush_ticker, stall_deadline.as_mut()) => match maintenance {
+                            Maintenance::Flush => {
+                                flush(&root, &mut ts, &mut bs, &mut ss)?;
+                                let refresh_now = Utc::now();
+                                if universe_refresh_due(universe_day, refresh_now, cfg.daily_refresh_utc_hour) {
+                                    disconnected_at = Some(refresh_now);
+                                    record_connection(
+                                        &root,
+                                        "universe_refresh_due",
+                                        "daily universe refresh due; reconnecting",
+                                        None,
+                                    )?;
+                                    break;
+                                }
+                            }
+                            Maintenance::Stalled => {
+                                handle_stall(&root, &mut ts, &mut bs, &mut ss)?;
+                                disconnected_at = Some(Utc::now());
+                                eprintln!("connection stalled: no frame within stall timeout");
+                                break;
+                            }
+                        },
                         got = upbit::next(&mut ws) => match got {
                             Ok(Some(Incoming::Trade(t))) => {
+                                stall_deadline.as_mut().reset(tokio::time::Instant::now() + stall_period);
                                 // Raw capture is authoritative: sequence checks only suppress detector state.
                                 ts.push(t.clone());
                                 let handled: Result<()> = (|| {
@@ -181,6 +218,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                 if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
                             }
                             Ok(Some(Incoming::Orderbook(b))) => {
+                                stall_deadline.as_mut().reset(tokio::time::Instant::now() + stall_period);
                                 bs.push(b.clone());
                                 let handled: Result<()> = (|| {
                                     let new = detector.on_orderbook(&b);
@@ -191,7 +229,9 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                 })();
                                 if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                stall_deadline.as_mut().reset(tokio::time::Instant::now() + stall_period);
+                            }
                             Err(e) => {
                                 flush(&root, &mut ts, &mut bs, &mut ss)?;
                                 disconnected_at = Some(Utc::now());
@@ -234,6 +274,41 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
         )?;
         delay = (delay * 2).min(60);
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Maintenance {
+    Flush,
+    Stalled,
+}
+
+async fn next_maintenance(
+    flush_ticker: &mut tokio::time::Interval,
+    mut stall_deadline: std::pin::Pin<&mut tokio::time::Sleep>,
+) -> Maintenance {
+    tokio::select! {
+        biased;
+        _ = &mut stall_deadline => Maintenance::Stalled,
+        _ = flush_ticker.tick() => Maintenance::Flush,
+    }
+}
+
+fn universe_refresh_due(
+    universe_day: NaiveDate,
+    now: chrono::DateTime<Utc>,
+    refresh_hour: u8,
+) -> bool {
+    now.date_naive() != universe_day && now.hour() >= u32::from(refresh_hour)
+}
+
+fn handle_stall(
+    root: &Path,
+    trades: &mut Vec<rustle::model::Trade>,
+    books: &mut Vec<rustle::model::Orderbook>,
+    signals: &mut Vec<rustle::model::Signal>,
+) -> Result<()> {
+    flush(root, trades, books, signals)?;
+    record_connection(root, "stalled", "no frame within stall timeout", None)
 }
 fn record_connection(root: &Path, state: &str, detail: &str, gap_ms: Option<i64>) -> Result<()> {
     let now = Utc::now();
@@ -501,6 +576,86 @@ fn report(cfg: &Config, csv: bool) -> Result<()> {
     }
     Ok(())
 }
+
+fn coverage(cfg: &Config, csv: bool) -> Result<()> {
+    let root = PathBuf::from(&cfg.data_root);
+    let trades: Vec<rustle::model::Trade> = storage::read_all(&root, "trades")?;
+    let books: Vec<rustle::model::Orderbook> = storage::read_all(&root, "orderbooks")?;
+    let live_signals: Vec<rustle::model::Signal> = storage::read_all(&root, "live_signals")?;
+    let events: Vec<ConnectionEvent> = storage::read_all(&root, "connection_events")?;
+    let rows = analysis::collection_coverage(&trades, &books, &live_signals, &events);
+    let status = analysis::collection_date_status(&trades, &books, cfg)?;
+
+    if csv {
+        println!("date,trades,orderbooks,live_signals,markets,disconnected,stalled,total_gap_ms,longest_gap_ms");
+        for row in &rows {
+            println!(
+                "{},{},{},{},{},{},{},{},{}",
+                row.date,
+                row.trade_count,
+                row.orderbook_count,
+                row.live_signal_count,
+                row.market_count,
+                row.disconnected_count,
+                row.stalled_count,
+                row.total_gap_ms,
+                row.longest_gap_ms,
+            );
+        }
+    } else {
+        println!("# Rustle collection coverage\n");
+        println!("| UTC date | Trades | Orderbooks | Live signals | Markets | Disconnected | Stalled | Total gap ms | Longest gap ms |");
+        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+        for row in &rows {
+            println!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                row.date,
+                row.trade_count,
+                row.orderbook_count,
+                row.live_signal_count,
+                row.market_count,
+                row.disconnected_count,
+                row.stalled_count,
+                row.total_gap_ms,
+                row.longest_gap_ms,
+            );
+        }
+        println!();
+    }
+    let summary = format!(
+        "{} of {} required contiguous UTC dates present",
+        status.present_count, status.required
+    );
+    if csv {
+        eprintln!("{summary}");
+        if !status.missing_dates.is_empty() {
+            eprintln!(
+                "Missing UTC dates: {}",
+                status
+                    .missing_dates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    } else {
+        println!("{summary}");
+        if !status.missing_dates.is_empty() {
+            println!(
+                "Missing UTC dates: {}",
+                status
+                    .missing_dates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn paper(cfg: &Config) -> Result<()> {
     let root = PathBuf::from(&cfg.data_root);
     let ids = load_fresh_ruleset(&root, cfg)?.rules;
@@ -662,5 +817,93 @@ mod tests {
             states,
             ["integrity_duplicate", "integrity_out_of_order"].into()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_ticks_do_not_extend_the_stall_deadline() {
+        let start = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval_at(
+            start + Duration::seconds(30).to_std().unwrap(),
+            Duration::seconds(30).to_std().unwrap(),
+        );
+        let deadline = tokio::time::sleep_until(start + Duration::seconds(90).to_std().unwrap());
+        tokio::pin!(deadline);
+
+        tokio::time::advance(Duration::seconds(30).to_std().unwrap()).await;
+        assert_eq!(
+            next_maintenance(&mut ticker, deadline.as_mut()).await,
+            Maintenance::Flush
+        );
+        tokio::time::advance(Duration::seconds(30).to_std().unwrap()).await;
+        assert_eq!(
+            next_maintenance(&mut ticker, deadline.as_mut()).await,
+            Maintenance::Flush
+        );
+        tokio::time::advance(Duration::seconds(30).to_std().unwrap()).await;
+        assert_eq!(
+            next_maintenance(&mut ticker, deadline.as_mut()).await,
+            Maintenance::Stalled
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_intervals_are_rejected_before_collection_connects() {
+        let cfg = Config {
+            stall_timeout_seconds: 0,
+            ..Config::default()
+        };
+        let error = collect(&cfg, true, false).await.unwrap_err();
+        assert!(error.to_string().contains("stall_timeout_seconds"));
+    }
+
+    #[test]
+    fn stall_flushes_buffers_and_records_the_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trades = vec![Trade {
+            meta: meta(0),
+            price: 10.,
+            volume: 1.,
+            side: Side::Buy,
+            sequential_id: None,
+        }];
+        let mut books = vec![];
+        let mut signals = vec![];
+
+        handle_stall(dir.path(), &mut trades, &mut books, &mut signals).unwrap();
+
+        assert!(trades.is_empty());
+        assert_eq!(
+            storage::read_all::<Trade>(dir.path(), "trades")
+                .unwrap()
+                .len(),
+            1
+        );
+        let events: Vec<ConnectionEvent> =
+            storage::read_all(dir.path(), "connection_events").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].state, "stalled");
+        assert_eq!(events[0].detail, "no frame within stall timeout");
+    }
+
+    #[test]
+    fn empty_flush_does_not_create_dataset_files() {
+        let dir = tempfile::tempdir().unwrap();
+        flush(dir.path(), &mut vec![], &mut vec![], &mut vec![]).unwrap();
+        assert!(!dir.path().join("trades").exists());
+        assert!(!dir.path().join("orderbooks").exists());
+        assert!(!dir.path().join("live_signals").exists());
+    }
+
+    #[test]
+    fn universe_refresh_waits_for_a_new_utc_date_and_configured_hour() {
+        let day = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let at = |date: NaiveDate, hour: u32| {
+            Utc.from_utc_datetime(&date.and_hms_opt(hour, 0, 0).unwrap())
+        };
+        assert!(!universe_refresh_due(day, at(day, 23), 3));
+        let next = day.succ_opt().unwrap();
+        assert!(!universe_refresh_due(day, at(next, 2), 3));
+        assert!(universe_refresh_due(day, at(next, 3), 3));
+        assert!(universe_refresh_due(day, at(next, 4), 3));
     }
 }

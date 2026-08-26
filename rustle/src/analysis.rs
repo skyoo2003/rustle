@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    model::{Meta, Orderbook, Side, Signal, SignalOutcome, Trade},
+    model::{ConnectionEvent, Meta, Orderbook, Side, Signal, SignalOutcome, Trade},
 };
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -56,6 +56,39 @@ pub fn current_collection_dates(
     books: &[Orderbook],
     cfg: &Config,
 ) -> Result<Vec<NaiveDate>> {
+    let status = collection_date_status(trades, books, cfg)?;
+    let required = status.required;
+    if status.end.is_none() {
+        bail!("need {required} UTC collection dates, found none");
+    }
+    if !status.missing_dates.is_empty() {
+        bail!(
+            "missing UTC collection dates: {}",
+            status
+                .missing_dates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(status.required_dates)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionDateStatus {
+    pub required: usize,
+    pub end: Option<NaiveDate>,
+    pub required_dates: Vec<NaiveDate>,
+    pub present_count: usize,
+    pub missing_dates: Vec<NaiveDate>,
+}
+
+pub fn collection_date_status(
+    trades: &[Trade],
+    books: &[Orderbook],
+    cfg: &Config,
+) -> Result<CollectionDateStatus> {
     let required = cfg.validation.tuning_days + cfg.validation.validation_days;
     if cfg.validation.tuning_days == 0 || cfg.validation.validation_days == 0 {
         bail!("tuning_days and validation_days must both be greater than zero");
@@ -66,25 +99,98 @@ pub fn current_collection_dates(
         .chain(books.iter().map(|b| b.meta.exchange_ts.date_naive()))
         .collect();
     if dates.is_empty() {
-        bail!("need {required} UTC collection dates, found none");
+        return Ok(CollectionDateStatus {
+            required,
+            end: None,
+            required_dates: vec![],
+            present_count: 0,
+            missing_dates: vec![],
+        });
     }
     let end = *dates.iter().next_back().expect("checked non-empty");
     let start = end - Duration::days((required - 1) as i64);
     let expected: Vec<_> = (0..required)
         .map(|i| start + Duration::days(i as i64))
         .collect();
-    let missing: Vec<_> = expected.iter().filter(|d| !dates.contains(d)).collect();
-    if !missing.is_empty() {
-        bail!(
-            "missing UTC collection dates: {}",
-            missing
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    let missing_dates: Vec<_> = expected
+        .iter()
+        .filter(|date| !dates.contains(date))
+        .copied()
+        .collect();
+    Ok(CollectionDateStatus {
+        required,
+        end: Some(end),
+        present_count: required - missing_dates.len(),
+        required_dates: expected,
+        missing_dates,
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoverageDay {
+    pub date: NaiveDate,
+    pub trade_count: usize,
+    pub orderbook_count: usize,
+    pub live_signal_count: usize,
+    pub market_count: usize,
+    pub disconnected_count: usize,
+    pub stalled_count: usize,
+    pub total_gap_ms: i64,
+    pub longest_gap_ms: i64,
+}
+
+pub fn collection_coverage(
+    trades: &[Trade],
+    books: &[Orderbook],
+    live_signals: &[Signal],
+    connection_events: &[ConnectionEvent],
+) -> Vec<CoverageDay> {
+    #[derive(Default)]
+    struct Counts {
+        day: CoverageDay,
+        markets: BTreeSet<String>,
     }
-    Ok(expected)
+    let mut days: BTreeMap<NaiveDate, Counts> = BTreeMap::new();
+    for trade in trades {
+        let entry = days.entry(trade.meta.exchange_ts.date_naive()).or_default();
+        entry.day.trade_count += 1;
+        entry.markets.insert(trade.meta.market.clone());
+    }
+    for book in books {
+        let entry = days.entry(book.meta.exchange_ts.date_naive()).or_default();
+        entry.day.orderbook_count += 1;
+        entry.markets.insert(book.meta.market.clone());
+    }
+    for signal in live_signals {
+        days.entry(signal.meta.exchange_ts.date_naive())
+            .or_default()
+            .day
+            .live_signal_count += 1;
+    }
+    for event in connection_events {
+        let entry = &mut days
+            .entry(event.meta.exchange_ts.date_naive())
+            .or_default()
+            .day;
+        match event.state.as_str() {
+            "disconnected" => entry.disconnected_count += 1,
+            "stalled" => entry.stalled_count += 1,
+            "connected" => {
+                if let Some(gap_ms) = event.gap_ms {
+                    entry.total_gap_ms += gap_ms;
+                    entry.longest_gap_ms = entry.longest_gap_ms.max(gap_ms);
+                }
+            }
+            _ => {}
+        }
+    }
+    days.into_iter()
+        .map(|(date, mut counts)| {
+            counts.day.date = date;
+            counts.day.market_count = counts.markets.len();
+            counts.day
+        })
+        .collect()
 }
 #[derive(Default)]
 struct State {
@@ -662,4 +768,125 @@ pub fn paper(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::model::{ConnectionEvent, Level, SCHEMA_VERSION};
+    use chrono::TimeZone;
+
+    fn meta(day: u32, market: &str) -> Meta {
+        let timestamp = Utc.with_ymd_and_hms(2025, 1, day, 12, 0, 0).unwrap();
+        Meta {
+            schema_version: SCHEMA_VERSION,
+            market: market.into(),
+            exchange_ts: timestamp,
+            receive_ts: timestamp,
+        }
+    }
+
+    fn trade(day: u32, market: &str) -> Trade {
+        Trade {
+            meta: meta(day, market),
+            price: 1.,
+            volume: 1.,
+            side: Side::Buy,
+            sequential_id: None,
+        }
+    }
+
+    fn book(day: u32, market: &str) -> Orderbook {
+        Orderbook {
+            meta: meta(day, market),
+            total_ask_size: 1.,
+            total_bid_size: 1.,
+            levels: Vec::<Level>::new(),
+        }
+    }
+
+    fn event(day: u32, state: &str, gap_ms: Option<i64>) -> ConnectionEvent {
+        ConnectionEvent {
+            meta: meta(day, "ALL"),
+            state: state.into(),
+            detail: "test".into(),
+            gap_ms,
+        }
+    }
+
+    #[test]
+    fn coverage_aggregates_daily_counts_markets_and_connected_gaps() {
+        let trades = vec![trade(1, "KRW-A"), trade(1, "KRW-B"), trade(3, "KRW-A")];
+        let books = vec![book(1, "KRW-A"), book(2, "KRW-C")];
+        let signals = vec![Signal {
+            meta: meta(2, "KRW-C"),
+            signal_type: "test".into(),
+            direction: Side::Buy,
+            feature_value: 1.,
+            baseline: 0.,
+            rationale: "test".into(),
+            market_snapshot: serde_json::json!({}),
+            rule_id: "test".into(),
+        }];
+        let events = vec![
+            event(1, "disconnected", Some(999)),
+            event(1, "stalled", None),
+            event(1, "connected", Some(100)),
+            event(1, "connected", Some(250)),
+            event(2, "reconnect", Some(10_000)),
+        ];
+
+        let rows = collection_coverage(&trades, &books, &signals, &events);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].trade_count, 2);
+        assert_eq!(rows[0].orderbook_count, 1);
+        assert_eq!(rows[0].market_count, 2);
+        assert_eq!(rows[0].disconnected_count, 1);
+        assert_eq!(rows[0].stalled_count, 1);
+        assert_eq!(rows[0].total_gap_ms, 350);
+        assert_eq!(rows[0].longest_gap_ms, 250);
+        assert_eq!(rows[1].live_signal_count, 1);
+        assert_eq!(rows[1].total_gap_ms, 0);
+    }
+
+    #[test]
+    fn collection_status_reports_the_trailing_window_and_missing_dates() {
+        let cfg = Config {
+            validation: crate::config::ValidationConfig {
+                tuning_days: 1,
+                validation_days: 2,
+                ..Config::default().validation
+            },
+            ..Config::default()
+        };
+        let trades = vec![trade(1, "KRW-A"), trade(3, "KRW-A")];
+        let status = collection_date_status(&trades, &[], &cfg).unwrap();
+
+        assert_eq!(status.required, 3);
+        assert_eq!(
+            status.end,
+            Some(NaiveDate::from_ymd_opt(2025, 1, 3).unwrap())
+        );
+        assert_eq!(status.present_count, 2);
+        assert_eq!(
+            status.missing_dates,
+            vec![NaiveDate::from_ymd_opt(2025, 1, 2).unwrap()]
+        );
+        assert!(current_collection_dates(&trades, &[], &cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("2025-01-02"));
+    }
+
+    #[test]
+    fn empty_data_has_no_coverage_rows_or_required_dates_present() {
+        let cfg = Config::default();
+        assert!(collection_coverage(&[], &[], &[], &[]).is_empty());
+        let status = collection_date_status(&[], &[], &cfg).unwrap();
+        assert_eq!(status.required, 28);
+        assert_eq!(status.present_count, 0);
+        assert!(status.required_dates.is_empty());
+        assert!(status.missing_dates.is_empty());
+    }
 }

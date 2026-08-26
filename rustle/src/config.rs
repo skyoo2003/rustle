@@ -10,12 +10,22 @@ pub struct Config {
     pub data_root: String,
     pub top_market_count: usize,
     pub daily_refresh_utc_hour: u8,
+    #[serde(default = "default_stall_timeout_seconds")]
+    pub stall_timeout_seconds: i64,
+    #[serde(default = "default_flush_interval_seconds")]
+    pub flush_interval_seconds: i64,
     pub imbalance_window_seconds: i64,
     pub trade_rate_window_seconds: i64,
     pub wall_min_krw: f64,
     pub candidate: CandidateConfig,
     pub validation: ValidationConfig,
     pub paper: PaperConfig,
+}
+fn default_stall_timeout_seconds() -> i64 {
+    90
+}
+fn default_flush_interval_seconds() -> i64 {
+    30
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateConfig {
@@ -65,6 +75,8 @@ impl Default for Config {
             data_root: "./data".into(),
             top_market_count: 20,
             daily_refresh_utc_hour: 0,
+            stall_timeout_seconds: default_stall_timeout_seconds(),
+            flush_interval_seconds: default_flush_interval_seconds(),
             imbalance_window_seconds: 60,
             trade_rate_window_seconds: 60,
             wall_min_krw: 10_000_000.0,
@@ -99,5 +111,54 @@ impl Config {
     }
     pub fn template() -> Result<String> {
         Ok(toml::to_string_pretty(&Self::default())?)
+    }
+
+    pub fn validate_collection_intervals(&self) -> Result<()> {
+        if self.stall_timeout_seconds <= 0 {
+            anyhow::bail!("stall_timeout_seconds must be greater than zero");
+        }
+        if self.flush_interval_seconds <= 0 {
+            anyhow::bail!("flush_interval_seconds must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_toml_uses_collection_interval_defaults() {
+        let mut value = toml::Value::try_from(Config::default()).unwrap();
+        let table = value.as_table_mut().unwrap();
+        table.remove("stall_timeout_seconds");
+        table.remove("flush_interval_seconds");
+
+        let loaded: Config = value.try_into().unwrap();
+
+        assert_eq!(loaded.stall_timeout_seconds, 90);
+        assert_eq!(loaded.flush_interval_seconds, 30);
+    }
+
+    #[test]
+    fn collection_intervals_must_be_positive() {
+        for (stall, flush, expected) in [
+            (0, 30, "stall_timeout_seconds"),
+            (-1, 30, "stall_timeout_seconds"),
+            (90, 0, "flush_interval_seconds"),
+            (90, -1, "flush_interval_seconds"),
+        ] {
+            let cfg = Config {
+                stall_timeout_seconds: stall,
+                flush_interval_seconds: flush,
+                ..Config::default()
+            };
+            assert!(cfg
+                .validate_collection_intervals()
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
     }
 }
