@@ -2,7 +2,11 @@ use anyhow::{Context, Result};
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use chrono::{DateTime, Utc};
-use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
+use parquet::{
+    arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter},
+    basic::{Compression, ZstdLevel},
+    file::properties::WriterProperties,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs::{self, File},
@@ -43,7 +47,13 @@ pub fn write<T: Serialize>(
         vec![Arc::new(StringArray::from(values)) as ArrayRef],
     )?;
     let file = File::create(&path)?;
-    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    // The payload column is JSON text with a repeated field-name skeleton, so it compresses
+    // ~34x. Left uncompressed a 28-day collection is ~542 GB; it is ~16 GB compressed.
+    // Level 3 is zstd's default and runs orders of magnitude faster than the stream it records.
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(Some(path))
@@ -155,9 +165,15 @@ mod tests {
             .map(|r| serde_json::to_string(r).unwrap().len())
             .sum();
 
-        let path = write(dir.path(), "orderbooks", "KRW-TEST", at(2025, 1, 1), &records)
-            .unwrap()
-            .unwrap();
+        let path = write(
+            dir.path(),
+            "orderbooks",
+            "KRW-TEST",
+            at(2025, 1, 1),
+            &records,
+        )
+        .unwrap()
+        .unwrap();
 
         let read_back: Vec<serde_json::Value> = read_all(dir.path(), "orderbooks").unwrap();
         assert_eq!(read_back, records, "compression must not alter payloads");
@@ -185,7 +201,9 @@ mod tests {
         // before this change must keep loading. There is no migration and none is needed.
         let dir = tempfile::tempdir().unwrap();
         let records = payloads(10);
-        let target = dir.path().join("orderbooks/date=2025-01-01/market=KRW-TEST");
+        let target = dir
+            .path()
+            .join("orderbooks/date=2025-01-01/market=KRW-TEST");
         fs::create_dir_all(&target).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "payload",

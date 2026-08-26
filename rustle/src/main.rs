@@ -226,8 +226,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                         let new = detector.on_trade(&t);
                                         retain_and_emit_alerts(&root, &mut alert_sink, &new, &mut ss)?;
                                     }
-                                    let should_flush = ts.len() >= 100;
-                                    if should_flush { flush(&root, &mut ts, &mut bs, &mut ss)?; }
+                                    if ts.len() >= MAX_BUFFERED_RECORDS { flush(&root, &mut ts, &mut bs, &mut ss)?; }
                                     Ok(())
                                 })();
                                 if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
@@ -238,7 +237,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                 let handled: Result<()> = (|| {
                                     let new = detector.on_orderbook(&b);
                                     retain_and_emit_alerts(&root, &mut alert_sink, &new, &mut ss)?;
-                                    if bs.len() >= 100 { flush(&root, &mut ts, &mut bs, &mut ss)?; }
+                                    if bs.len() >= MAX_BUFFERED_RECORDS { flush(&root, &mut ts, &mut bs, &mut ss)?; }
                                     Ok(())
                                 })();
                                 if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
