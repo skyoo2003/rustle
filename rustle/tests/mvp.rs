@@ -126,6 +126,8 @@ fn wall_cancel_signal_has_evidence() {
         .find(|x| x.signal_type == "wall_disappearance")
         .unwrap();
     assert!(!w.rationale.is_empty() && w.market_snapshot.get("market").is_some());
+    assert!(w.rationale.contains("200 KRW Buy wall fell to 11"));
+    assert!(w.rationale.contains("qualifying floor 100 KRW"));
     assert_eq!(w.market_snapshot["evidence"]["source"], "orderbook");
     assert!(w.market_snapshot["evidence"]["levels"].is_array());
 }
@@ -165,6 +167,8 @@ fn trade_snapshot_includes_trigger_and_rolling_baseline() {
         signal.market_snapshot["evidence"]["rolling_notional_mean"],
         10.0
     );
+    assert!(signal.rationale.contains("aggressive notional 40"));
+    assert!(signal.rationale.contains("threshold 3.0x over 5 trades"));
     assert_eq!(signal.market_snapshot["evidence"]["trigger"]["price"], 40.0);
 }
 
@@ -308,7 +312,11 @@ fn threshold_signals_fire_on_crossing_and_rearm_after_reset() {
         ..high.clone()
     };
 
-    assert_eq!(detector.on_orderbook(&high).len(), 2);
+    let first = detector.on_orderbook(&high);
+    assert_eq!(first.len(), 2);
+    assert!(first
+        .iter()
+        .any(|signal| signal.rationale.contains("threshold 0.40, bid-heavy")));
     assert!(detector.on_orderbook(&still_high).is_empty());
     assert!(detector.on_orderbook(&neutral).is_empty());
     assert_eq!(detector.on_orderbook(&high_again).len(), 2);
@@ -401,7 +409,10 @@ fn trade_rate_signal_fires_on_crossing_and_rearms_after_eviction() {
     for second in 0..5 {
         assert!(detector.on_trade(&trade(second)).is_empty());
     }
-    assert_eq!(detector.on_trade(&trade(5)).len(), 1);
+    let first = detector.on_trade(&trade(5));
+    assert_eq!(first.len(), 1);
+    assert!(first[0].rationale.contains("5 trades in 60s window"));
+    assert!(first[0].rationale.contains("threshold 0.5x"));
     assert!(detector.on_trade(&trade(6)).is_empty());
     assert!(detector.on_trade(&trade(70)).is_empty());
     for second in 71..75 {

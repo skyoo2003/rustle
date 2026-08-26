@@ -105,6 +105,8 @@ pub struct AlertEvent {
     pub emitted_at: DateTime<Utc>,
     pub rule_key: String,
     pub signal: Signal,
+    #[serde(default)]
+    pub validation: Option<crate::analysis::RuleResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,4 +116,35 @@ pub struct PaperSummary {
     pub cumulative_net_pnl_pct: f64,
     pub win_rate: f64,
     pub long_only_benchmark_pnl_pct: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_alert_event_json_defaults_validation_to_none() {
+        let json = serde_json::json!({
+            "emitted_at": "2025-01-01T00:00:00Z",
+            "rule_key": "synthetic:test",
+            "signal": {
+                "meta": {
+                    "schema_version": 1,
+                    "market": "KRW-TEST",
+                    "exchange_ts": "2025-01-01T00:00:00Z",
+                    "receive_ts": "2025-01-01T00:00:00Z"
+                },
+                "signal_type": "synthetic",
+                "direction": "buy",
+                "feature_value": 1.0,
+                "baseline": 0.0,
+                "rationale": "test",
+                "market_snapshot": {},
+                "rule_id": "test"
+            }
+        });
+
+        let event: AlertEvent = serde_json::from_value(json).unwrap();
+        assert!(event.validation.is_none());
+    }
 }

@@ -1,11 +1,11 @@
 use anyhow::{bail, Result};
-use chrono::{NaiveDate, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use rustle::{
     analysis,
     config::Config,
     model::{
-        AlertEvent, ConnectionEvent, Meta, PaperSummary, QualifiedRuleSet, SignalOutcome,
+        AlertEvent, ConnectionEvent, Meta, PaperSummary, QualifiedRuleSet, Signal, SignalOutcome,
         UniverseSnapshot, SCHEMA_VERSION,
     },
     storage,
@@ -51,7 +51,11 @@ enum Command {
         csv: bool,
     },
     /// Print explainable alerts only for rules that passed validation.
-    Alert,
+    Alert {
+        /// Print each complete AlertEvent as JSON Lines instead of the human-readable block.
+        #[arg(long)]
+        json: bool,
+    },
     Paper,
 }
 #[tokio::main]
@@ -70,7 +74,7 @@ async fn main() -> Result<()> {
                 Command::Analyze => analyze(&cfg),
                 Command::Report { csv } => report(&cfg, csv),
                 Command::Coverage { csv } => coverage(&cfg, csv),
-                Command::Alert => alert(&cfg),
+                Command::Alert { json } => alert(&cfg, json),
                 Command::Paper => paper(&cfg),
                 _ => unreachable!(),
             }
@@ -101,8 +105,16 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
     let mut delay = 1u64;
     let mut disconnected_at = None;
     let mut detector = analysis::SignalDetector::new(cfg);
-    let active_rules = load_fresh_ruleset(&root, cfg).ok().map(|set| set.rules);
-    if emit_alerts && active_rules.as_ref().is_none_or(|rules| rules.is_empty()) {
+    let active_rules = load_fresh_ruleset(&root, cfg)
+        .and_then(|set| qualified_rule_results(&set))
+        .unwrap_or_default();
+    let mut alert_sink = AlertSink::new(
+        root.clone(),
+        emit_alerts,
+        active_rules,
+        cfg.alert.cooldown_seconds,
+    );
+    if emit_alerts && alert_sink.rules.is_empty() {
         eprintln!("alerts blocked: no active validation-qualified ruleset; collection continues");
     }
     loop {
@@ -208,8 +220,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                 let handled: Result<()> = (|| {
                                     if sequence_ok(&mut sequences, &t, &root)? {
                                         let new = detector.on_trade(&t);
-                                        emit_live_alerts(&root, active_rules.as_deref(), emit_alerts, &new)?;
-                                        ss.extend(new);
+                                        retain_and_emit_alerts(&root, &mut alert_sink, &new, &mut ss)?;
                                     }
                                     let should_flush = ts.len() >= 100;
                                     if should_flush { flush(&root, &mut ts, &mut bs, &mut ss)?; }
@@ -222,8 +233,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                 bs.push(b.clone());
                                 let handled: Result<()> = (|| {
                                     let new = detector.on_orderbook(&b);
-                                    emit_live_alerts(&root, active_rules.as_deref(), emit_alerts, &new)?;
-                                    ss.extend(new);
+                                    retain_and_emit_alerts(&root, &mut alert_sink, &new, &mut ss)?;
                                     if bs.len() >= 100 { flush(&root, &mut ts, &mut bs, &mut ss)?; }
                                     Ok(())
                                 })();
@@ -390,33 +400,114 @@ fn load_fresh_ruleset(root: &Path, cfg: &Config) -> Result<QualifiedRuleSet> {
     }
     Ok(set)
 }
-fn emit_live_alerts(
-    root: &Path,
-    rules: Option<&[String]>,
-    enabled: bool,
-    signals: &[rustle::model::Signal],
-) -> Result<()> {
-    if !enabled {
-        return Ok(());
+fn qualified_rule_results(set: &QualifiedRuleSet) -> Result<HashMap<String, analysis::RuleResult>> {
+    let audit = set
+        .audit
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("ruleset is from an older format; run analyze"))?;
+    let mut results = HashMap::new();
+    for rule in &set.rules {
+        let result = audit
+            .results
+            .iter()
+            .find(|result| result.passed && result.rule_id == *rule)
+            .ok_or_else(|| {
+                anyhow::anyhow!("qualified rule {rule} has no passed validation result")
+            })?;
+        results.insert(rule.clone(), result.clone());
     }
-    let Some(rules) = rules else { return Ok(()) };
-    for signal in signals
-        .iter()
-        .filter(|signal| rules.contains(&analysis::rule_key(signal)))
-    {
-        let event = AlertEvent {
-            emitted_at: Utc::now(),
-            rule_key: analysis::rule_key(signal),
-            signal: signal.clone(),
-        };
-        println!(
-            "ALERT {} {} {:?}: {}",
-            event.signal.meta.exchange_ts,
-            event.signal.meta.market,
-            event.signal.direction,
-            event.signal.rationale
+    Ok(results)
+}
+
+struct AlertCooldown {
+    seconds: i64,
+    last_emitted: HashMap<(String, String), DateTime<Utc>>,
+}
+
+impl AlertCooldown {
+    fn new(seconds: i64) -> Self {
+        Self {
+            seconds,
+            last_emitted: HashMap::new(),
+        }
+    }
+
+    fn is_suppressed(&self, signal: &Signal, rule_key: &str) -> bool {
+        if self.seconds == 0 {
+            return false;
+        }
+        let key = (signal.meta.market.clone(), rule_key.to_owned());
+        self.last_emitted.get(&key).is_some_and(|last| {
+            signal.meta.exchange_ts < *last + chrono::Duration::seconds(self.seconds)
+        })
+    }
+
+    fn record(&mut self, signal: &Signal, rule_key: &str) {
+        self.last_emitted.insert(
+            (signal.meta.market.clone(), rule_key.to_owned()),
+            signal.meta.exchange_ts,
         );
-        storage::append_jsonl(root, "alerts", event.emitted_at, &event)?;
+    }
+}
+
+struct AlertSink {
+    enabled: bool,
+    rules: HashMap<String, analysis::RuleResult>,
+    root: PathBuf,
+    cooldown: AlertCooldown,
+}
+
+impl AlertSink {
+    fn new(
+        root: PathBuf,
+        enabled: bool,
+        rules: HashMap<String, analysis::RuleResult>,
+        cooldown_seconds: i64,
+    ) -> Self {
+        Self {
+            enabled,
+            rules,
+            root,
+            cooldown: AlertCooldown::new(cooldown_seconds),
+        }
+    }
+
+    fn emit(&mut self, signals: &[Signal]) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        for signal in signals {
+            let rule_key = analysis::rule_key(signal);
+            let Some(validation) = self.rules.get(&rule_key).cloned() else {
+                continue;
+            };
+            if self.cooldown.is_suppressed(signal, &rule_key) {
+                continue;
+            }
+            let event = AlertEvent {
+                emitted_at: Utc::now(),
+                rule_key: rule_key.clone(),
+                signal: signal.clone(),
+                validation: Some(validation),
+            };
+            storage::append_jsonl(&self.root, "alerts", event.emitted_at, &event)?;
+            self.cooldown.record(signal, &rule_key);
+            print!("{}", analysis::render_alert(&event));
+        }
+        Ok(())
+    }
+}
+
+fn retain_and_emit_alerts(
+    root: &Path,
+    sink: &mut AlertSink,
+    new: &[Signal],
+    live_signals: &mut Vec<Signal>,
+) -> Result<()> {
+    live_signals.extend_from_slice(new);
+    if let Err(error) = sink.emit(new) {
+        eprintln!("alert emission failed; collection continues: {error}");
+        record_connection(root, "alert_error", &error.to_string(), None)?;
     }
     Ok(())
 }
@@ -671,24 +762,40 @@ fn paper(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn alert(cfg: &Config) -> Result<()> {
+fn alert(cfg: &Config, json: bool) -> Result<()> {
+    cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
-    let passed = load_fresh_ruleset(&root, cfg)?.rules;
+    let passed = match load_fresh_ruleset(&root, cfg).and_then(|set| qualified_rule_results(&set)) {
+        Ok(passed) => passed,
+        Err(error) => {
+            eprintln!("alerts blocked: {error}");
+            return Ok(());
+        }
+    };
     let trades = storage::read_all(&root, "trades")?;
     let books = storage::read_all(&root, "orderbooks")?;
     let signals = analysis::build_signals(&trades, &books, cfg);
-    for signal in signals
-        .iter()
-        .filter(|s| passed.contains(&format!("{}:{}", s.signal_type, s.rule_id)))
-    {
-        println!(
-            "ALERT {} {} {:?}: {}\n{}",
-            signal.meta.exchange_ts,
-            signal.meta.market,
-            signal.direction,
-            signal.rationale,
-            serde_json::to_string(signal)?
-        );
+    let mut cooldown = AlertCooldown::new(cfg.alert.cooldown_seconds);
+    for signal in &signals {
+        let rule_key = analysis::rule_key(signal);
+        let Some(validation) = passed.get(&rule_key).cloned() else {
+            continue;
+        };
+        if cooldown.is_suppressed(signal, &rule_key) {
+            continue;
+        }
+        let event = AlertEvent {
+            emitted_at: Utc::now(),
+            rule_key: rule_key.clone(),
+            signal: signal.clone(),
+            validation: Some(validation),
+        };
+        cooldown.record(signal, &rule_key);
+        if json {
+            println!("{}", serde_json::to_string(&event)?);
+        } else {
+            print!("{}", analysis::render_alert(&event));
+        }
     }
     if passed.is_empty() {
         eprintln!("alerts blocked: no validation-qualified rules");
@@ -711,6 +818,156 @@ mod tests {
             exchange_ts,
             receive_ts: exchange_ts,
         }
+    }
+
+    fn signal_at(minutes: i64, market: &str, rule_id: &str) -> Signal {
+        let mut meta = meta(minutes);
+        meta.market = market.into();
+        Signal {
+            meta,
+            signal_type: "synthetic".into(),
+            direction: Side::Buy,
+            feature_value: 2.0,
+            baseline: 1.0,
+            rationale: "observed 2.0 (threshold 1.0)".into(),
+            market_snapshot: serde_json::json!({"evidence": {"source": "test"}}),
+            rule_id: rule_id.into(),
+        }
+    }
+
+    fn rule_result(rule_key: &str) -> analysis::RuleResult {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        analysis::RuleResult {
+            rule_id: rule_key.into(),
+            signal_type: "synthetic".into(),
+            train_count: 100,
+            train_hit_rate: 0.6,
+            validation_count: 50,
+            validation_hit_rate: 0.58,
+            random_hit_rate: 0.49,
+            lift: 0.09,
+            ci_low: 0.03,
+            ci_high: 0.15,
+            retention: 0.96,
+            passed: true,
+            tuning_start: start,
+            tuning_end: start + Duration::days(13),
+            validation_start: start + Duration::days(14),
+            validation_end: start + Duration::days(27),
+        }
+    }
+
+    #[test]
+    fn cooldown_is_scoped_by_market_and_rule_and_zero_disables_it() {
+        let first = signal_at(0, "KRW-A", "candidate");
+        let inside = signal_at(1, "KRW-A", "candidate");
+        let boundary = signal_at(15, "KRW-A", "candidate");
+        let other_market = signal_at(1, "KRW-B", "candidate");
+        let other_rule = signal_at(1, "KRW-A", "other");
+        let key = analysis::rule_key(&first);
+        let mut cooldown = AlertCooldown::new(900);
+
+        assert!(!cooldown.is_suppressed(&first, &key));
+        cooldown.record(&first, &key);
+        assert!(cooldown.is_suppressed(&inside, &key));
+        assert!(!cooldown.is_suppressed(&boundary, &key));
+        assert!(!cooldown.is_suppressed(&other_market, &key));
+        assert!(!cooldown.is_suppressed(&other_rule, "synthetic:other"));
+
+        let mut disabled = AlertCooldown::new(0);
+        disabled.record(&first, &key);
+        assert!(!disabled.is_suppressed(&inside, &key));
+    }
+
+    #[test]
+    fn alert_sink_attaches_validation_and_suppresses_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "synthetic:candidate";
+        let mut sink = AlertSink::new(
+            dir.path().to_path_buf(),
+            true,
+            HashMap::from([(key.into(), rule_result(key))]),
+            900,
+        );
+        sink.emit(&[
+            signal_at(0, "KRW-A", "candidate"),
+            signal_at(1, "KRW-A", "candidate"),
+            signal_at(1, "KRW-B", "candidate"),
+        ])
+        .unwrap();
+
+        let date_dir = std::fs::read_dir(dir.path().join("alerts"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let contents = std::fs::read_to_string(date_dir.join("events.jsonl")).unwrap();
+        let events: Vec<AlertEvent> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].validation.as_ref().unwrap().validation_count, 50);
+        assert_eq!(events[1].signal.meta.market, "KRW-B");
+    }
+
+    #[test]
+    fn cooldown_suppression_does_not_remove_live_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "synthetic:candidate";
+        let mut sink = AlertSink::new(
+            dir.path().to_path_buf(),
+            true,
+            HashMap::from([(key.into(), rule_result(key))]),
+            900,
+        );
+        let detected = vec![
+            signal_at(0, "KRW-A", "candidate"),
+            signal_at(1, "KRW-A", "candidate"),
+        ];
+        let mut buffered = vec![];
+
+        retain_and_emit_alerts(dir.path(), &mut sink, &detected, &mut buffered).unwrap();
+
+        assert_eq!(buffered.len(), 2);
+        let date_dir = std::fs::read_dir(dir.path().join("alerts"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let contents = std::fs::read_to_string(date_dir.join("events.jsonl")).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[test]
+    fn alert_write_failure_keeps_live_signal_and_collection_can_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alerts"), "blocks alert directory").unwrap();
+        let key = "synthetic:candidate";
+        let mut sink = AlertSink::new(
+            dir.path().to_path_buf(),
+            true,
+            HashMap::from([(key.into(), rule_result(key))]),
+            900,
+        );
+        let detected = vec![signal_at(0, "KRW-A", "candidate")];
+        let mut buffered = vec![];
+
+        retain_and_emit_alerts(dir.path(), &mut sink, &detected, &mut buffered).unwrap();
+
+        assert_eq!(buffered.len(), 1);
+        let events: Vec<ConnectionEvent> =
+            storage::read_all(dir.path(), "connection_events").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].state, "alert_error");
+    }
+
+    #[test]
+    fn alert_json_flag_parses() {
+        let cli = Cli::try_parse_from(["rustle", "alert", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Alert { json: true }));
     }
 
     #[test]
