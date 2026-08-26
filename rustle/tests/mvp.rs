@@ -681,7 +681,10 @@ fn hold_benchmark_buys_at_window_open_sells_at_window_close_and_pays_one_round_t
             .abs()
             < 1e-12
     );
-    assert!(report.summary.excess_pnl_pct < 0.0, "hold wins this fixture");
+    assert!(
+        report.summary.excess_pnl_pct < 0.0,
+        "hold wins this fixture"
+    );
 }
 
 #[test]

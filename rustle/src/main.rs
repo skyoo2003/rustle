@@ -5,7 +5,7 @@ use rustle::{
     analysis,
     config::Config,
     model::{
-        AlertEvent, ConnectionEvent, Meta, PaperSummary, QualifiedRuleSet, Signal, SignalOutcome,
+        AlertEvent, ConnectionEvent, Meta, QualifiedRuleSet, Signal, SignalOutcome,
         UniverseSnapshot, SCHEMA_VERSION,
     },
     storage,
@@ -716,9 +716,10 @@ fn coverage(cfg: &Config, csv: bool) -> Result<()> {
 }
 
 fn paper(cfg: &Config) -> Result<()> {
+    cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
-    let ids = load_fresh_ruleset(&root, cfg)?.rules;
-    if ids.is_empty() {
+    let set = load_fresh_ruleset(&root, cfg)?;
+    if set.rules.is_empty() {
         storage::clear_dataset(&root, "paper_trades")?;
         storage::clear_dataset(&root, "paper_summaries")?;
         println!("paper blocked: no validation-qualified rules");
@@ -727,21 +728,20 @@ fn paper(cfg: &Config) -> Result<()> {
     let trades = storage::read_all(&root, "trades")?;
     let books = storage::read_all(&root, "orderbooks")?;
     let signals = analysis::build_signals(&trades, &books, cfg);
-    let p = analysis::paper(&signals, &trades, &ids, cfg);
-    let paper_count = p.len();
-    let summary = PaperSummary {
-        generated_at: Utc::now(),
-        trade_count: paper_count,
-        cumulative_net_pnl_pct: p.iter().map(|trade| trade.net_pnl_pct).sum(),
-        win_rate: p.iter().filter(|trade| trade.net_pnl_pct > 0.0).count() as f64
-            / paper_count.max(1) as f64,
-        long_only_benchmark_pnl_pct: p
-            .iter()
-            .map(|trade| trade.long_only_benchmark_pnl_pct)
-            .sum(),
-    };
+    // Days 1-14 are the days each rule was chosen on; simulating them would restate the
+    // tuning result as a finding. The gate authorized the validation window, so that is
+    // the window that gets traded.
+    let mut report = analysis::paper(
+        &signals,
+        &trades,
+        &set.rules,
+        (set.validation_start, set.validation_end),
+        Utc::now(),
+        cfg,
+    );
+    let paper_trades = std::mem::take(&mut report.trades);
     storage::clear_dataset(&root, "paper_trades")?;
-    write_partitioned(&root, "paper_trades", p, |paper_trade| {
+    write_partitioned(&root, "paper_trades", paper_trades, |paper_trade| {
         &paper_trade.signal.meta
     })?;
     storage::clear_dataset(&root, "paper_summaries")?;
@@ -749,15 +749,15 @@ fn paper(cfg: &Config) -> Result<()> {
         &root,
         "paper_summaries",
         "ALL",
-        summary.generated_at,
-        std::slice::from_ref(&summary),
+        report.summary.generated_at,
+        std::slice::from_ref(&report.summary),
     )?;
     println!(
-        "simulated {} paper trades; net {:.3}%, win {:.1}%, long-only benchmark {:.3}%",
-        summary.trade_count,
-        summary.cumulative_net_pnl_pct,
-        summary.win_rate * 100.0,
-        summary.long_only_benchmark_pnl_pct
+        "simulated {} paper trades; net {:.3}%, hold {:.3}%, excess {:+.3}pp",
+        report.summary.trade_count,
+        report.summary.cumulative_net_pnl_pct,
+        report.summary.hodl_pnl_pct,
+        report.summary.excess_pnl_pct
     );
     Ok(())
 }
