@@ -12,7 +12,7 @@ use rustle::{
     upbit::{self, Incoming},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -379,8 +379,13 @@ fn load_fresh_ruleset(root: &Path, cfg: &Config) -> Result<QualifiedRuleSet> {
         bail!("ruleset is stale because configuration changed; run analyze");
     }
     let trades = storage::read_all(root, "trades")?;
-    let books = storage::read_all(root, "orderbooks")?;
-    if audit.collection_dates != analysis::current_collection_dates(&trades, &books, cfg)? {
+    let books: Vec<rustle::model::Orderbook> = storage::read_all(root, "orderbooks")?;
+    let orderbook_dates = books
+        .iter()
+        .map(|book| book.meta.exchange_ts.date_naive())
+        .collect();
+    if audit.collection_dates != analysis::current_collection_dates(&trades, &orderbook_dates, cfg)?
+    {
         bail!("ruleset is stale because its collection window changed; run analyze");
     }
     Ok(set)
@@ -458,13 +463,19 @@ where
     Ok(())
 }
 fn analyze(cfg: &Config) -> Result<()> {
+    cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
     let t = storage::read_all(&root, "trades")?;
     let b = storage::read_all(&root, "orderbooks")?;
-    let s = analysis::build_signals(t.clone(), b.clone(), cfg);
+    let orderbook_dates: BTreeSet<_> = b
+        .iter()
+        .map(|book: &rustle::model::Orderbook| book.meta.exchange_ts.date_naive())
+        .collect();
+    let s = analysis::build_signals(&t, &b, cfg);
+    drop(b);
     // Signals are derived artefacts. Replace them so a repeated analyze is deterministic.
     storage::clear_dataset(&root, "signals")?;
-    let audit = analysis::evaluate_with_audit(&s, &t, &b, cfg)?;
+    let audit = analysis::evaluate_with_audit(&s, &t, &orderbook_dates, cfg)?;
     let outcomes = analysis::build_outcomes(&s, &t, cfg);
     let signal_count = s.len();
     write_partitioned(&root, "signals", s, |signal| &signal.meta)?;
@@ -519,60 +530,13 @@ fn analyze(cfg: &Config) -> Result<()> {
 }
 fn report(cfg: &Config, csv: bool) -> Result<()> {
     let root = PathBuf::from(&cfg.data_root);
-    let r = &load_fresh_ruleset(&root, cfg)?
+    let audit = load_fresh_ruleset(&root, cfg)?
         .audit
-        .expect("fresh loader requires audit")
-        .results;
+        .expect("fresh loader requires audit");
     if csv {
-        println!(
-            "signal_type,rule_id,tuning_start,tuning_end,validation_start,validation_end,train_count,train_hit_rate,validation_count,validation_hit_rate,random_hit_rate,lift,ci_low,ci_high,passed"
-        );
-        for x in r {
-            println!(
-                "{},{},{},{},{},{},{},{:.4},{},{:.4},{:.4},{:.4},{:.4},{:.4},{}",
-                x.signal_type,
-                x.rule_id,
-                x.tuning_start,
-                x.tuning_end,
-                x.validation_start,
-                x.validation_end,
-                x.train_count,
-                x.train_hit_rate,
-                x.validation_count,
-                x.validation_hit_rate,
-                x.random_hit_rate,
-                x.lift,
-                x.ci_low,
-                x.ci_high,
-                x.passed
-            )
-        }
+        print!("{}", analysis::render_csv_report(&audit));
     } else {
-        println!("# Rustle validation report\n\n| Signal type | Selected rule | Tuning | Validation | Train n / hit | Validation n / hit | Matched random | Lift | 95% CI | Pass |\n|---|---|---|---|---|---|---:|---:|---|---|");
-        for x in r {
-            println!(
-                "| {} | {} | {}–{} | {}–{} | {} / {:.1}% | {} / {:.1}% | {:.1}% | {:.1}% | [{:.1}%, {:.1}%] | {} |",
-                x.signal_type,
-                x.rule_id,
-                x.tuning_start,
-                x.tuning_end,
-                x.validation_start,
-                x.validation_end,
-                x.train_count,
-                x.train_hit_rate * 100.,
-                x.validation_count,
-                x.validation_hit_rate * 100.,
-                x.random_hit_rate * 100.,
-                x.lift * 100.,
-                x.ci_low * 100.,
-                x.ci_high * 100.,
-                if x.passed { "yes" } else { "no" }
-            )
-        }
-        if r.is_empty() || !r.iter().any(|x| x.passed) {
-            println!("\n**Milestones 3–4 blocked:** no candidate has passed untouched validation.")
-        };
-        println!("\n```json\n{}\n```", serde_json::to_string_pretty(&r)?)
+        print!("{}", analysis::render_markdown_report(&audit)?);
     }
     Ok(())
 }
@@ -584,7 +548,11 @@ fn coverage(cfg: &Config, csv: bool) -> Result<()> {
     let live_signals: Vec<rustle::model::Signal> = storage::read_all(&root, "live_signals")?;
     let events: Vec<ConnectionEvent> = storage::read_all(&root, "connection_events")?;
     let rows = analysis::collection_coverage(&trades, &books, &live_signals, &events);
-    let status = analysis::collection_date_status(&trades, &books, cfg)?;
+    let orderbook_dates = books
+        .iter()
+        .map(|book| book.meta.exchange_ts.date_naive())
+        .collect();
+    let status = analysis::collection_date_status(&trades, &orderbook_dates, cfg)?;
 
     if csv {
         println!("date,trades,orderbooks,live_signals,markets,disconnected,stalled,total_gap_ms,longest_gap_ms");
@@ -665,16 +633,10 @@ fn paper(cfg: &Config) -> Result<()> {
         println!("paper blocked: no validation-qualified rules");
         return Ok(());
     }
-    let p = analysis::paper(
-        &analysis::build_signals(
-            storage::read_all(&root, "trades")?,
-            storage::read_all(&root, "orderbooks")?,
-            cfg,
-        ),
-        &storage::read_all(&root, "trades")?,
-        &ids,
-        cfg,
-    );
+    let trades = storage::read_all(&root, "trades")?;
+    let books = storage::read_all(&root, "orderbooks")?;
+    let signals = analysis::build_signals(&trades, &books, cfg);
+    let p = analysis::paper(&signals, &trades, &ids, cfg);
     let paper_count = p.len();
     let summary = PaperSummary {
         generated_at: Utc::now(),
@@ -712,11 +674,9 @@ fn paper(cfg: &Config) -> Result<()> {
 fn alert(cfg: &Config) -> Result<()> {
     let root = PathBuf::from(&cfg.data_root);
     let passed = load_fresh_ruleset(&root, cfg)?.rules;
-    let signals = analysis::build_signals(
-        storage::read_all(&root, "trades")?,
-        storage::read_all(&root, "orderbooks")?,
-        cfg,
-    );
+    let trades = storage::read_all(&root, "trades")?;
+    let books = storage::read_all(&root, "orderbooks")?;
+    let signals = analysis::build_signals(&trades, &books, cfg);
     for signal in signals
         .iter()
         .filter(|s| passed.contains(&format!("{}:{}", s.signal_type, s.rule_id)))

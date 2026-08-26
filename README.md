@@ -75,10 +75,19 @@ The MVP procedure is a hard gate:
 
 1. Collect continuously for 28 consecutive UTC dates. Raw `trades` and `orderbooks` are never replaced; sequence anomalies and connection gaps are recorded separately.
 2. Run `analyze`. It deterministically regenerates candidate signals and 15-minute outcomes from raw data, uses days 1–14 to tune one rule per signal type, and leaves days 15–28 untouched for validation.
-3. A rule passes only with the minimum validation sample and a wholly positive paired-bootstrap CI. The complete audit and a full configuration fingerprint are persisted with the versioned active ruleset.
+3. A rule passes only when it has the minimum validation sample, the lower bound of its family-wise-corrected paired-bootstrap CI is positive, and its out-of-sample hit rate retains at least 80% of its tuning hit rate. Bonferroni family-wise correction is enabled by default across selected signal types. The complete audit—including every tuning candidate, its matched-random result, selection status, effective alpha, and retention—and a full configuration fingerprint are persisted with the versioned active ruleset.
 4. Only then use `collect --emit-alerts`, `alert`, `report`, and `paper`. Each consumes that same persisted audit/ruleset and blocks when its exact configuration fingerprint or validated collection window is stale. Paper entries must occur within 60 seconds by default; output includes fees, slippage, win rate, cumulative net P&L, and a long-only benchmark (buy at each simulated entry and sell at its exit regardless of signal side).
 
 If no rule passes, alerting and paper trading remain blocked: revise the rules or stop the project. `analyze` replaces its derived `signals`, `signal_outcomes`, evaluation, and active-ruleset files so reruns cannot accumulate stale results.
+
+The generated config uses 10,000 bootstrap iterations and enables
+`validation.family_wise_correction` by default; set it to `false` only when an explicitly
+uncorrected analysis is intended. `validation.entry_max_lag_seconds` must be non-negative.
+The Markdown report includes both the selected-rule validation table and the complete tuning
+candidate table, and always ends with an explicit `GATE: PASS` or `GATE: FAIL` verdict and reasons.
+`report --csv` emits one row per candidate with the fixed schema
+`signal_type,rule_id,selected,tuning_start,tuning_end,validation_start,validation_end,train_count,train_hit_rate,train_random_hit_rate,validation_count,validation_hit_rate,random_hit_rate,lift,ci_low,ci_high,retention,passed`;
+validation fields are blank for candidates that were not selected.
 
 ## Status
 

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    fmt::Write,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,11 +26,23 @@ pub struct RuleResult {
     pub lift: f64,
     pub ci_low: f64,
     pub ci_high: f64,
+    #[serde(default)]
+    pub retention: f64,
     pub passed: bool,
     pub tuning_start: NaiveDate,
     pub tuning_end: NaiveDate,
     pub validation_start: NaiveDate,
     pub validation_end: NaiveDate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateSummary {
+    pub rule_id: String,
+    pub signal_type: String,
+    pub train_count: usize,
+    pub train_hit_rate: f64,
+    pub train_random_hit_rate: f64,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +52,12 @@ pub struct EvaluationAudit {
     pub collection_dates: Vec<NaiveDate>,
     pub validation_config: crate::config::ValidationConfig,
     pub bootstrap_seed: u64,
+    #[serde(default)]
+    pub candidates: Vec<CandidateSummary>,
+    #[serde(default)]
+    pub family_size: usize,
+    #[serde(default)]
+    pub effective_tail_alpha: f64,
     pub results: Vec<RuleResult>,
 }
 /// A deterministic fingerprint of every configuration value that can affect collection,
@@ -53,10 +72,10 @@ pub fn config_fingerprint(cfg: &Config) -> String {
 
 pub fn current_collection_dates(
     trades: &[Trade],
-    books: &[Orderbook],
+    orderbook_dates: &BTreeSet<NaiveDate>,
     cfg: &Config,
 ) -> Result<Vec<NaiveDate>> {
-    let status = collection_date_status(trades, books, cfg)?;
+    let status = collection_date_status(trades, orderbook_dates, cfg)?;
     let required = status.required;
     if status.end.is_none() {
         bail!("need {required} UTC collection dates, found none");
@@ -86,7 +105,7 @@ pub struct CollectionDateStatus {
 
 pub fn collection_date_status(
     trades: &[Trade],
-    books: &[Orderbook],
+    orderbook_dates: &BTreeSet<NaiveDate>,
     cfg: &Config,
 ) -> Result<CollectionDateStatus> {
     let required = cfg.validation.tuning_days + cfg.validation.validation_days;
@@ -96,7 +115,7 @@ pub fn collection_date_status(
     let dates: BTreeSet<NaiveDate> = trades
         .iter()
         .map(|t| t.meta.exchange_ts.date_naive())
-        .chain(books.iter().map(|b| b.meta.exchange_ts.date_naive()))
+        .chain(orderbook_dates.iter().copied())
         .collect();
     if dates.is_empty() {
         return Ok(CollectionDateStatus {
@@ -364,13 +383,11 @@ struct SelectedCandidate<'a> {
     train_hits: Vec<bool>,
     train_controls: Vec<bool>,
 }
-pub fn build_signals(
-    mut trades: Vec<Trade>,
-    mut books: Vec<Orderbook>,
-    cfg: &Config,
-) -> Vec<Signal> {
-    trades.sort_by(trade_cmp);
-    books.sort_by(book_cmp);
+pub fn build_signals(trades: &[Trade], books: &[Orderbook], cfg: &Config) -> Vec<Signal> {
+    let mut trades: Vec<&Trade> = trades.iter().collect();
+    let mut books: Vec<&Orderbook> = books.iter().collect();
+    trades.sort_by(|a, b| trade_cmp(a, b));
+    books.sort_by(|a, b| book_cmp(a, b));
     let mut events: Vec<(DateTime<Utc>, bool, usize)> = trades
         .iter()
         .enumerate()
@@ -387,9 +404,9 @@ pub fn build_signals(
     let mut out = vec![];
     for (_, is_trade, i) in events {
         if is_trade {
-            out.extend(detector.on_trade(&trades[i]));
+            out.extend(detector.on_trade(trades[i]));
         } else {
-            out.extend(detector.on_orderbook(&books[i]));
+            out.extend(detector.on_orderbook(books[i]));
         }
     }
     out
@@ -483,6 +500,20 @@ impl<'a> TradeIndex<'a> {
         let last = values.partition_point(|trade| trade.meta.exchange_ts < end);
         &values[first..last]
     }
+    fn last_ts(&self, market: &str) -> Option<DateTime<Utc>> {
+        self.by_market
+            .get(market)
+            .and_then(|values| values.last())
+            .map(|trade| trade.meta.exchange_ts)
+    }
+    fn complete_prefix_len(&self, market: &str, date: NaiveDate, horizon_minutes: i64) -> usize {
+        let on_date = self.on_date(market, date);
+        self.last_ts(market)
+            .map(|last| last - Duration::minutes(horizon_minutes))
+            .map_or(0, |cutoff| {
+                on_date.partition_point(|trade| trade.meta.exchange_ts <= cutoff)
+            })
+    }
     fn between(&self, market: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> &[&'a Trade] {
         let Some(values) = self.by_market.get(market) else {
             return &[];
@@ -564,6 +595,18 @@ fn rate(values: &[bool]) -> f64 {
     values.iter().filter(|&&x| x).count() as f64 / values.len().max(1) as f64
 }
 
+fn retention(train_hit_rate: f64, validation_hit_rate: f64) -> f64 {
+    if train_hit_rate == 0.0 {
+        0.0
+    } else {
+        validation_hit_rate / train_hit_rate
+    }
+}
+
+fn passes_gate(validation_count: usize, ci_low: f64, retention: f64, cfg: &Config) -> bool {
+    validation_count >= cfg.validation.min_validation_signals && ci_low > 0.0 && retention >= 0.80
+}
+
 fn seeded(seed: u64, label: &str) -> StdRng {
     // Stable FNV-1a mixing avoids HashMap iteration order affecting reproducibility.
     let hash = label.bytes().fold(0xcbf29ce484222325u64, |h, b| {
@@ -587,13 +630,13 @@ fn paired_outcomes(
             continue;
         }
         // The pool is matched on exactly the signal's market and UTC date.
-        let pool: Vec<&Trade> = index
-            .on_date(&signal.meta.market, signal.meta.exchange_ts.date_naive())
-            .iter()
-            .copied()
-            .filter(|t| outcome_at(signal, t.meta.exchange_ts, index, cfg).complete)
-            .collect();
-        if let Some(t) = (!pool.is_empty()).then(|| pool[rng.random_range(0..pool.len())]) {
+        let on_date = index.on_date(&signal.meta.market, signal.meta.exchange_ts.date_naive());
+        let pool_len = index.complete_prefix_len(
+            &signal.meta.market,
+            signal.meta.exchange_ts.date_naive(),
+            cfg.validation.horizon_minutes,
+        );
+        if let Some(t) = (pool_len > 0).then(|| on_date[rng.random_range(0..pool_len)]) {
             hits.push(signal_outcome.hit.unwrap_or(false));
             controls.push(
                 outcome_at(signal, t.meta.exchange_ts, index, cfg)
@@ -605,7 +648,13 @@ fn paired_outcomes(
     (hits, controls)
 }
 
-fn confidence_interval(hits: &[bool], controls: &[bool], cfg: &Config, label: &str) -> (f64, f64) {
+fn confidence_interval(
+    hits: &[bool],
+    controls: &[bool],
+    cfg: &Config,
+    label: &str,
+    tail_alpha: f64,
+) -> (f64, f64) {
     if hits.is_empty() {
         return (0.0, 0.0);
     }
@@ -624,19 +673,24 @@ fn confidence_interval(hits: &[bool], controls: &[bool], cfg: &Config, label: &s
     }
     samples.sort_by(|a, b| a.total_cmp(b));
     let last = samples.len() - 1;
-    (samples[(last * 25) / 1000], samples[(last * 975) / 1000])
+    let low = ((last as f64) * tail_alpha).floor() as usize;
+    let high = ((last as f64) * (1.0 - tail_alpha)).floor() as usize;
+    (samples[low], samples[high])
 }
 
 pub fn evaluate_with_audit(
     signals: &[Signal],
     trades: &[Trade],
-    books: &[Orderbook],
+    orderbook_dates: &BTreeSet<NaiveDate>,
     cfg: &Config,
 ) -> Result<EvaluationAudit> {
     if cfg.validation.bootstrap_iterations == 0 {
         bail!("bootstrap_iterations must be greater than zero");
     }
-    let expected = current_collection_dates(trades, books, cfg)?;
+    if cfg.validation.entry_max_lag_seconds < 0 {
+        bail!("entry_max_lag_seconds must be non-negative");
+    }
+    let expected = current_collection_dates(trades, orderbook_dates, cfg)?;
     let start = *expected.first().expect("validated non-empty");
     let end = *expected.last().expect("validated non-empty");
     let tuning_end = start + Duration::days((cfg.validation.tuning_days - 1) as i64);
@@ -650,16 +704,25 @@ pub fn evaluate_with_audit(
             .or_default()
             .push(signal);
     }
+    let index = TradeIndex::new(trades);
     let mut selected: BTreeMap<String, SelectedCandidate<'_>> = BTreeMap::new();
+    let mut candidate_summaries = Vec::new();
     for (id, candidate) in candidates {
         let train: Vec<_> = candidate
             .iter()
             .copied()
             .filter(|s| s.meta.exchange_ts.date_naive() <= tuning_end)
             .collect();
-        let index = TradeIndex::new(trades);
         let (hits, controls) = paired_outcomes(&train, &index, cfg, &format!("train:{id}"));
         let key = candidate.first().expect("non-empty").signal_type.clone();
+        candidate_summaries.push(CandidateSummary {
+            rule_id: id.clone(),
+            signal_type: key.clone(),
+            train_count: hits.len(),
+            train_hit_rate: rate(&hits),
+            train_random_hit_rate: rate(&controls),
+            selected: false,
+        });
         let replace = selected
             .get(&key)
             .map(|best| {
@@ -680,7 +743,18 @@ pub fn evaluate_with_audit(
             );
         }
     }
-    let results = selected
+    for summary in &mut candidate_summaries {
+        summary.selected = selected
+            .get(&summary.signal_type)
+            .is_some_and(|candidate| candidate.id == summary.rule_id);
+    }
+    struct ValidationCandidate<'a> {
+        signal_type: String,
+        selected: SelectedCandidate<'a>,
+        hits: Vec<bool>,
+        controls: Vec<bool>,
+    }
+    let validation_candidates: Vec<_> = selected
         .into_iter()
         .map(|(signal_type, selected)| {
             let validation: Vec<_> = selected
@@ -691,25 +765,56 @@ pub fn evaluate_with_audit(
                 .collect();
             let (hits, controls) = paired_outcomes(
                 &validation,
-                &TradeIndex::new(trades),
+                &index,
                 cfg,
                 &format!("validation:{}", selected.id),
             );
-            let (ci_low, ci_high) = confidence_interval(&hits, &controls, cfg, &selected.id);
+            ValidationCandidate {
+                signal_type,
+                selected,
+                hits,
+                controls,
+            }
+        })
+        .collect();
+    let family_size = validation_candidates
+        .iter()
+        .filter(|candidate| !candidate.hits.is_empty())
+        .count();
+    let effective_tail_alpha = if cfg.validation.family_wise_correction && family_size > 0 {
+        0.025 / family_size as f64
+    } else {
+        0.025
+    };
+    let results = validation_candidates
+        .into_iter()
+        .map(|candidate| {
+            let (ci_low, ci_high) = confidence_interval(
+                &candidate.hits,
+                &candidate.controls,
+                cfg,
+                &candidate.selected.id,
+                effective_tail_alpha,
+            );
+            let hits = candidate.hits;
+            let controls = candidate.controls;
             let validation_hit_rate = rate(&hits);
             let random_hit_rate = rate(&controls);
+            let train_hit_rate = rate(&candidate.selected.train_hits);
+            let retention = retention(train_hit_rate, validation_hit_rate);
             RuleResult {
-                rule_id: selected.id,
-                signal_type,
-                train_count: selected.train_hits.len(),
-                train_hit_rate: rate(&selected.train_hits),
+                rule_id: candidate.selected.id,
+                signal_type: candidate.signal_type,
+                train_count: candidate.selected.train_hits.len(),
+                train_hit_rate,
                 validation_count: hits.len(),
                 validation_hit_rate,
                 random_hit_rate,
                 lift: validation_hit_rate - random_hit_rate,
                 ci_low,
                 ci_high,
-                passed: hits.len() >= cfg.validation.min_validation_signals && ci_low > 0.0,
+                retention,
+                passed: passes_gate(hits.len(), ci_low, retention, cfg),
                 tuning_start: start,
                 tuning_end,
                 validation_start,
@@ -723,6 +828,9 @@ pub fn evaluate_with_audit(
         collection_dates: expected,
         validation_config: cfg.validation.clone(),
         bootstrap_seed: cfg.validation.bootstrap_seed,
+        candidates: candidate_summaries,
+        family_size,
+        effective_tail_alpha,
         results,
     })
 }
@@ -730,11 +838,177 @@ pub fn evaluate_with_audit(
 pub fn evaluate(
     signals: &[Signal],
     trades: &[Trade],
-    books: &[Orderbook],
+    orderbook_dates: &BTreeSet<NaiveDate>,
     cfg: &Config,
 ) -> Result<Vec<RuleResult>> {
-    Ok(evaluate_with_audit(signals, trades, books, cfg)?.results)
+    Ok(evaluate_with_audit(signals, trades, orderbook_dates, cfg)?.results)
 }
+
+pub fn render_csv_report(audit: &EvaluationAudit) -> String {
+    let mut output = String::from(
+        "signal_type,rule_id,selected,tuning_start,tuning_end,validation_start,validation_end,train_count,train_hit_rate,train_random_hit_rate,validation_count,validation_hit_rate,random_hit_rate,lift,ci_low,ci_high,retention,passed\n",
+    );
+    for candidate in &audit.candidates {
+        let result = audit
+            .results
+            .iter()
+            .find(|result| candidate.selected && result.rule_id == candidate.rule_id);
+        let (tuning_start, tuning_end, validation_start, validation_end) = audit
+            .results
+            .first()
+            .map(|result| {
+                (
+                    result.tuning_start,
+                    result.tuning_end,
+                    result.validation_start,
+                    result.validation_end,
+                )
+            })
+            .unwrap_or((
+                audit.input_start,
+                audit.input_start
+                    + Duration::days(
+                        (audit.validation_config.tuning_days.saturating_sub(1)) as i64,
+                    ),
+                audit.input_start + Duration::days(audit.validation_config.tuning_days as i64),
+                audit.input_end,
+            ));
+        write!(
+            output,
+            "{},{},{},{},{},{},{},{},{:.4},{:.4}",
+            candidate.signal_type,
+            candidate.rule_id,
+            candidate.selected,
+            tuning_start,
+            tuning_end,
+            validation_start,
+            validation_end,
+            candidate.train_count,
+            candidate.train_hit_rate,
+            candidate.train_random_hit_rate,
+        )
+        .expect("writing to String cannot fail");
+        if let Some(result) = result {
+            writeln!(
+                output,
+                ",{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{}",
+                result.validation_count,
+                result.validation_hit_rate,
+                result.random_hit_rate,
+                result.lift,
+                result.ci_low,
+                result.ci_high,
+                result.retention,
+                result.passed,
+            )
+            .expect("writing to String cannot fail");
+        } else {
+            output.push_str(",,,,,,,,\n");
+        }
+    }
+    output
+}
+
+pub fn render_markdown_report(audit: &EvaluationAudit) -> Result<String> {
+    let mut output = String::from(
+        "# Rustle validation report\n\n## Selected rules\n\n| Signal type | Selected rule | Tuning | Validation | Train n / hit | Validation n / hit | Matched random | Lift | Corrected CI | Retention | Pass |\n|---|---|---|---|---|---|---:|---:|---|---:|---|\n",
+    );
+    for result in &audit.results {
+        writeln!(
+            output,
+            "| {} | {} | {}–{} | {}–{} | {} / {:.1}% | {} / {:.1}% | {:.1}% | {:.1}% | [{:.1}%, {:.1}%] | {:.1}% | {} |",
+            result.signal_type,
+            result.rule_id,
+            result.tuning_start,
+            result.tuning_end,
+            result.validation_start,
+            result.validation_end,
+            result.train_count,
+            result.train_hit_rate * 100.0,
+            result.validation_count,
+            result.validation_hit_rate * 100.0,
+            result.random_hit_rate * 100.0,
+            result.lift * 100.0,
+            result.ci_low * 100.0,
+            result.ci_high * 100.0,
+            result.retention * 100.0,
+            if result.passed { "yes" } else { "no" },
+        )
+        .expect("writing to String cannot fail");
+    }
+    writeln!(
+        output,
+        "\nFamily size: {}; effective tail alpha: {:.6} (family-wise correction: {}).",
+        audit.family_size,
+        audit.effective_tail_alpha,
+        if audit.validation_config.family_wise_correction {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    )
+    .expect("writing to String cannot fail");
+    output.push_str(
+        "\n## All tuning candidates\n\n| Signal type | Rule | Train n | Train hit | Matched random | Selected |\n|---|---|---:|---:|---:|---|\n",
+    );
+    for candidate in &audit.candidates {
+        writeln!(
+            output,
+            "| {} | {} | {} | {:.1}% | {:.1}% | {} |",
+            candidate.signal_type,
+            candidate.rule_id,
+            candidate.train_count,
+            candidate.train_hit_rate * 100.0,
+            candidate.train_random_hit_rate * 100.0,
+            if candidate.selected { "yes" } else { "no" },
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("\n```json\n");
+    output.push_str(&serde_json::to_string_pretty(audit)?);
+    output.push_str("\n```\n\n");
+
+    let passed: Vec<_> = audit
+        .results
+        .iter()
+        .filter(|result| result.passed)
+        .map(|result| result.rule_id.as_str())
+        .collect();
+    if !passed.is_empty() {
+        writeln!(output, "GATE: PASS — {}", passed.join(", "))
+            .expect("writing to String cannot fail");
+    } else if audit.results.is_empty() {
+        output.push_str("GATE: FAIL — no selected rules\n");
+    } else {
+        let reasons: Vec<_> = audit
+            .results
+            .iter()
+            .map(|result| {
+                let mut failures = Vec::new();
+                if result.validation_count < audit.validation_config.min_validation_signals {
+                    failures.push(format!(
+                        "insufficient validation sample ({}/{})",
+                        result.validation_count, audit.validation_config.min_validation_signals
+                    ));
+                }
+                if result.ci_low <= 0.0 {
+                    failures.push("CI lower bound is non-positive".to_string());
+                }
+                if result.retention < 0.80 {
+                    failures.push(format!(
+                        "retention below 80% ({:.1}%)",
+                        result.retention * 100.0
+                    ));
+                }
+                format!("{}: {}", result.rule_id, failures.join(", "))
+            })
+            .collect();
+        writeln!(output, "GATE: FAIL — {}", reasons.join("; "))
+            .expect("writing to String cannot fail");
+    }
+    Ok(output)
+}
+
 pub fn paper(
     signals: &[Signal],
     trades: &[Trade],
@@ -861,7 +1135,7 @@ mod coverage_tests {
             ..Config::default()
         };
         let trades = vec![trade(1, "KRW-A"), trade(3, "KRW-A")];
-        let status = collection_date_status(&trades, &[], &cfg).unwrap();
+        let status = collection_date_status(&trades, &BTreeSet::new(), &cfg).unwrap();
 
         assert_eq!(status.required, 3);
         assert_eq!(
@@ -873,7 +1147,7 @@ mod coverage_tests {
             status.missing_dates,
             vec![NaiveDate::from_ymd_opt(2025, 1, 2).unwrap()]
         );
-        assert!(current_collection_dates(&trades, &[], &cfg)
+        assert!(current_collection_dates(&trades, &BTreeSet::new(), &cfg)
             .unwrap_err()
             .to_string()
             .contains("2025-01-02"));
@@ -883,10 +1157,253 @@ mod coverage_tests {
     fn empty_data_has_no_coverage_rows_or_required_dates_present() {
         let cfg = Config::default();
         assert!(collection_coverage(&[], &[], &[], &[]).is_empty());
-        let status = collection_date_status(&[], &[], &cfg).unwrap();
+        let status = collection_date_status(&[], &BTreeSet::new(), &cfg).unwrap();
         assert_eq!(status.required, 28);
         assert_eq!(status.present_count, 0);
         assert!(status.required_dates.is_empty());
         assert!(status.missing_dates.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod milestone_two_tests {
+    use super::*;
+    use crate::model::SCHEMA_VERSION;
+    use chrono::TimeZone;
+
+    fn trade(day: u32, minute: i64, price: f64) -> Trade {
+        let timestamp =
+            Utc.with_ymd_and_hms(2025, 1, day, 0, 0, 0).unwrap() + Duration::minutes(minute);
+        Trade {
+            meta: Meta {
+                schema_version: SCHEMA_VERSION,
+                market: "KRW-TEST".into(),
+                exchange_ts: timestamp,
+                receive_ts: timestamp,
+            },
+            price,
+            volume: 1.0,
+            side: Side::Buy,
+            sequential_id: None,
+        }
+    }
+
+    fn signal(at: DateTime<Utc>) -> Signal {
+        Signal {
+            meta: Meta {
+                schema_version: SCHEMA_VERSION,
+                market: "KRW-TEST".into(),
+                exchange_ts: at,
+                receive_ts: at,
+            },
+            signal_type: "synthetic".into(),
+            direction: Side::Buy,
+            feature_value: 1.0,
+            baseline: 0.0,
+            rationale: "test".into(),
+            market_snapshot: serde_json::json!({}),
+            rule_id: "candidate".into(),
+        }
+    }
+
+    #[test]
+    fn complete_prefix_matches_exhaustive_pool_across_gaps_ties_and_final_horizon() {
+        let trades = vec![
+            trade(1, 0, 100.0),
+            trade(1, 0, 101.0),
+            trade(1, 10, 102.0),
+            trade(3, 0, 103.0),
+            trade(3, 15, 104.0),
+        ];
+        let cfg = Config::default();
+        let index = TradeIndex::new(&trades);
+        for day in [1, 2, 3] {
+            let date = NaiveDate::from_ymd_opt(2025, 1, day).unwrap();
+            let on_date = index.on_date("KRW-TEST", date);
+            let probe = signal(date.and_hms_opt(0, 0, 0).expect("valid midnight").and_utc());
+            let exhaustive: Vec<_> = on_date
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    outcome_at(&probe, candidate.meta.exchange_ts, &index, &cfg).complete
+                })
+                .map(|candidate| (candidate.meta.exchange_ts, candidate.price))
+                .collect();
+            let prefix_len =
+                index.complete_prefix_len("KRW-TEST", date, cfg.validation.horizon_minutes);
+            let optimized: Vec<_> = on_date[..prefix_len]
+                .iter()
+                .map(|candidate| (candidate.meta.exchange_ts, candidate.price))
+                .collect();
+            assert_eq!(optimized, exhaustive);
+        }
+        assert_eq!(
+            index
+                .complete_prefix_len("KRW-TEST", NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(), 15,),
+            1,
+            "a trade exactly one horizon before the last trade remains eligible"
+        );
+    }
+
+    #[test]
+    fn correction_can_make_a_nominally_positive_interval_non_positive() {
+        let mut cfg = Config::default();
+        cfg.validation.bootstrap_iterations = 20_000;
+        let mut hits = vec![true; 30];
+        let mut controls = vec![false; 30];
+        hits.extend(vec![false; 15]);
+        controls.extend(vec![true; 15]);
+        hits.extend(vec![false; 55]);
+        controls.extend(vec![false; 55]);
+
+        let nominal = confidence_interval(&hits, &controls, &cfg, "family-fixture", 0.025);
+        let corrected = confidence_interval(&hits, &controls, &cfg, "family-fixture", 0.025 / 4.0);
+
+        assert!(nominal.0 > 0.0, "nominal interval was {nominal:?}");
+        assert!(corrected.0 <= 0.0, "corrected interval was {corrected:?}");
+    }
+
+    #[test]
+    fn retention_zero_is_finite_and_is_a_hard_gate() {
+        let mut cfg = Config::default();
+        cfg.validation.min_validation_signals = 1;
+        assert_eq!(retention(0.0, 1.0), 0.0);
+        assert!(!passes_gate(10, 0.1, 0.79, &cfg));
+        assert!(passes_gate(10, 0.1, 0.80, &cfg));
+    }
+
+    #[test]
+    fn evaluation_rejects_negative_entry_lag_before_readiness_checks() {
+        let mut cfg = Config::default();
+        cfg.validation.entry_max_lag_seconds = -1;
+        let error = evaluate_with_audit(&[], &[], &BTreeSet::new(), &cfg).unwrap_err();
+        assert!(error.to_string().contains("entry_max_lag_seconds"));
+    }
+
+    #[test]
+    fn evaluation_uses_complete_validation_families_for_effective_alpha() {
+        let mut cfg = Config::default();
+        cfg.validation.tuning_days = 1;
+        cfg.validation.validation_days = 1;
+        cfg.validation.bootstrap_iterations = 100;
+        let trades = vec![
+            trade(1, 0, 100.0),
+            trade(1, 15, 101.0),
+            trade(2, 0, 100.0),
+            trade(2, 15, 101.0),
+        ];
+        let mut signals = Vec::new();
+        for family in 0..4 {
+            for day in [1, 2] {
+                let mut candidate = signal(trade(day, 0, 100.0).meta.exchange_ts);
+                candidate.signal_type = format!("family-{family}");
+                candidate.rule_id = format!("rule-{family}");
+                signals.push(candidate);
+            }
+        }
+
+        let corrected = evaluate_with_audit(&signals, &trades, &BTreeSet::new(), &cfg).unwrap();
+        assert_eq!(corrected.family_size, 4);
+        assert_eq!(corrected.effective_tail_alpha, 0.025 / 4.0);
+
+        cfg.validation.family_wise_correction = false;
+        let nominal = evaluate_with_audit(&signals, &trades, &BTreeSet::new(), &cfg).unwrap();
+        assert_eq!(nominal.family_size, 4);
+        assert_eq!(nominal.effective_tail_alpha, 0.025);
+    }
+
+    fn audit_fixture() -> EvaluationAudit {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 1, 28).unwrap();
+        let cfg = Config::default();
+        EvaluationAudit {
+            input_start: start,
+            input_end: end,
+            collection_dates: vec![start, end],
+            validation_config: cfg.validation,
+            bootstrap_seed: 7,
+            candidates: vec![
+                CandidateSummary {
+                    rule_id: "synthetic:a".into(),
+                    signal_type: "synthetic".into(),
+                    train_count: 60,
+                    train_hit_rate: 0.75,
+                    train_random_hit_rate: 0.50,
+                    selected: true,
+                },
+                CandidateSummary {
+                    rule_id: "synthetic:b".into(),
+                    signal_type: "synthetic".into(),
+                    train_count: 40,
+                    train_hit_rate: 0.60,
+                    train_random_hit_rate: 0.55,
+                    selected: false,
+                },
+            ],
+            family_size: 2,
+            effective_tail_alpha: 0.0125,
+            results: vec![RuleResult {
+                rule_id: "synthetic:a".into(),
+                signal_type: "synthetic".into(),
+                train_count: 60,
+                train_hit_rate: 0.75,
+                validation_count: 20,
+                validation_hit_rate: 0.50,
+                random_hit_rate: 0.45,
+                lift: 0.05,
+                ci_low: 0.0,
+                ci_high: 0.10,
+                retention: 2.0 / 3.0,
+                passed: false,
+                tuning_start: start,
+                tuning_end: start + Duration::days(13),
+                validation_start: start + Duration::days(14),
+                validation_end: end,
+            }],
+        }
+    }
+
+    #[test]
+    fn reports_render_all_candidates_blank_unselected_fields_and_explicit_verdict() {
+        let audit = audit_fixture();
+        let csv = render_csv_report(&audit);
+        assert_eq!(csv.lines().count(), 3);
+        assert_eq!(csv.lines().next().unwrap(), "signal_type,rule_id,selected,tuning_start,tuning_end,validation_start,validation_end,train_count,train_hit_rate,train_random_hit_rate,validation_count,validation_hit_rate,random_hit_rate,lift,ci_low,ci_high,retention,passed");
+        let unselected = csv.lines().nth(2).unwrap();
+        assert!(unselected.starts_with("synthetic,synthetic:b,false,"));
+        assert!(unselected.ends_with(",,,,,,,,"));
+
+        let markdown = render_markdown_report(&audit).unwrap();
+        assert!(markdown.contains("## All tuning candidates"));
+        assert!(markdown.contains("effective tail alpha: 0.012500"));
+        assert!(markdown.contains("retention below 80%"));
+        assert!(markdown
+            .trim_end()
+            .ends_with("CI lower bound is non-positive, retention below 80% (66.7%)"));
+        assert!(markdown.contains("GATE: FAIL"));
+
+        let mut passing = audit;
+        passing.results[0].passed = true;
+        let markdown = render_markdown_report(&passing).unwrap();
+        assert_eq!(markdown.lines().last(), Some("GATE: PASS — synthetic:a"));
+    }
+
+    #[test]
+    fn old_audit_json_uses_defaults_for_new_fields() {
+        let mut value = serde_json::to_value(audit_fixture()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("candidates");
+        object.remove("family_size");
+        object.remove("effective_tail_alpha");
+        object.get_mut("results").unwrap().as_array_mut().unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("retention");
+
+        let old: EvaluationAudit = serde_json::from_value(value).unwrap();
+        assert!(old.candidates.is_empty());
+        assert_eq!(old.family_size, 0);
+        assert_eq!(old.effective_tail_alpha, 0.0);
+        assert_eq!(old.results[0].retention, 0.0);
     }
 }

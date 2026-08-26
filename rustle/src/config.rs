@@ -48,6 +48,9 @@ pub struct ValidationConfig {
     #[serde(default = "default_entry_max_lag_seconds")]
     pub entry_max_lag_seconds: i64,
     pub hit_threshold_pct: f64,
+    /// Apply a Bonferroni correction across selected signal families.
+    #[serde(default = "default_family_wise_correction")]
+    pub family_wise_correction: bool,
     pub bootstrap_iterations: usize,
     pub bootstrap_seed: u64,
 }
@@ -62,6 +65,9 @@ fn default_min_validation_signals() -> usize {
 }
 fn default_entry_max_lag_seconds() -> i64 {
     60
+}
+fn default_family_wise_correction() -> bool {
+    true
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperConfig {
@@ -92,7 +98,8 @@ impl Default for Config {
                 horizon_minutes: 15,
                 entry_max_lag_seconds: 60,
                 hit_threshold_pct: 0.3,
-                bootstrap_iterations: 1000,
+                family_wise_correction: true,
+                bootstrap_iterations: 10_000,
                 bootstrap_seed: 7,
             },
             paper: PaperConfig {
@@ -120,6 +127,9 @@ impl Config {
         if self.flush_interval_seconds <= 0 {
             anyhow::bail!("flush_interval_seconds must be greater than zero");
         }
+        if self.validation.entry_max_lag_seconds < 0 {
+            anyhow::bail!("entry_max_lag_seconds must be non-negative");
+        }
         Ok(())
     }
 }
@@ -134,11 +144,18 @@ mod tests {
         let table = value.as_table_mut().unwrap();
         table.remove("stall_timeout_seconds");
         table.remove("flush_interval_seconds");
+        table
+            .get_mut("validation")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .remove("family_wise_correction");
 
         let loaded: Config = value.try_into().unwrap();
 
         assert_eq!(loaded.stall_timeout_seconds, 90);
         assert_eq!(loaded.flush_interval_seconds, 30);
+        assert!(loaded.validation.family_wise_correction);
     }
 
     #[test]
@@ -160,5 +177,16 @@ mod tests {
                 .to_string()
                 .contains(expected));
         }
+    }
+
+    #[test]
+    fn entry_lag_must_be_non_negative() {
+        let mut cfg = Config::default();
+        cfg.validation.entry_max_lag_seconds = -1;
+        assert!(cfg
+            .validate_collection_intervals()
+            .unwrap_err()
+            .to_string()
+            .contains("entry_max_lag_seconds"));
     }
 }
