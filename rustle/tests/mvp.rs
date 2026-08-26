@@ -71,6 +71,51 @@ fn book_on(date: NaiveDate, hour: u32, market: &str, bid: f64, ask: f64) -> Orde
 }
 
 #[test]
+fn footprint_counts_every_parquet_file_and_its_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    for day in [1, 2] {
+        let date = NaiveDate::from_ymd_opt(2025, 1, day).unwrap();
+        let t = trade_on(date, 12, "KRW-A", 10.0);
+        storage::write(dir.path(), "trades", "KRW-A", t.meta.exchange_ts, &[t]).unwrap();
+    }
+
+    let (bytes, files) = storage::footprint(dir.path()).unwrap();
+
+    assert_eq!(files, 2);
+    assert!(bytes > 0, "two parquet files cannot occupy zero bytes");
+    assert_eq!(
+        storage::footprint(&dir.path().join("absent")).unwrap(),
+        (0, 0)
+    );
+}
+
+#[test]
+fn the_projection_extrapolates_the_collected_dates_to_the_full_gate_window() {
+    // The instrument that would have caught a 542 GB collection on day one instead of day 28.
+    let projected = analysis::render_footprint_projection(2_000_000_000, 40_000, 2, 28);
+
+    assert!(
+        projected.contains("28"),
+        "must name the required window: {projected}"
+    );
+    // 2 GB and 40k files over 2 dates extrapolates to 28 GB and 560k files.
+    assert!(
+        projected.contains("28.0 GB"),
+        "must project total bytes: {projected}"
+    );
+    assert!(
+        projected.contains("560,000"),
+        "must project total files: {projected}"
+    );
+
+    let nothing_yet = analysis::render_footprint_projection(0, 0, 0, 28);
+    assert!(
+        !nothing_yet.contains("NaN") && !nothing_yet.contains("inf"),
+        "zero collected dates must not divide by zero: {nothing_yet}"
+    );
+}
+
+#[test]
 fn dataset_dates_lists_partitions_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let days = [
