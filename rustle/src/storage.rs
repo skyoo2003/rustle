@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use parquet::{
     arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter},
     basic::{Compression, ZstdLevel},
@@ -65,6 +65,10 @@ pub fn read_all<T: DeserializeOwned>(root: &Path, dataset: &str) -> Result<Vec<T
     }
     let mut files = vec![];
     walk(&base, &mut files)?;
+    read_parquet_files(files)
+}
+
+fn read_parquet_files<T: DeserializeOwned>(files: Vec<PathBuf>) -> Result<Vec<T>> {
     let mut out = vec![];
     for p in files
         .into_iter()
@@ -88,6 +92,56 @@ pub fn read_all<T: DeserializeOwned>(root: &Path, dataset: &str) -> Result<Vec<T
     }
     Ok(out)
 }
+/// The UTC dates a dataset has partitions for, ascending. Reads directory names only:
+/// the partition layout already encodes the date, so selecting one costs a `read_dir`
+/// rather than a parse of every record.
+pub fn dataset_dates(root: &Path, dataset: &str) -> Result<Vec<NaiveDate>> {
+    let base = root.join(dataset);
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+    let mut dates = vec![];
+    for entry in fs::read_dir(&base)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("partition name is not valid UTF-8")?;
+        // A partition we cannot read is a missing collection day. Skipping it silently
+        // would shrink the gate window without saying so.
+        let raw = name
+            .strip_prefix("date=")
+            .ok_or_else(|| anyhow::anyhow!("unexpected partition {name} in dataset {dataset}"))?;
+        dates.push(
+            NaiveDate::parse_from_str(raw, "%F").with_context(|| {
+                format!("unparseable partition date {name} in dataset {dataset}")
+            })?,
+        );
+    }
+    dates.sort();
+    Ok(dates)
+}
+
+/// One UTC partition of a dataset. The chunk unit for `analyze`.
+pub fn read_date<T: DeserializeOwned>(
+    root: &Path,
+    dataset: &str,
+    date: NaiveDate,
+) -> Result<Vec<T>> {
+    let base = root
+        .join(dataset)
+        .join(format!("date={}", date.format("%F")));
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+    let mut files = vec![];
+    walk(&base, &mut files)?;
+    read_parquet_files(files)
+}
+
 /// Replace a derived dataset. Raw collection datasets are never replaced by this helper.
 pub fn clear_dataset(root: &Path, dataset: &str) -> Result<()> {
     let path = root.join(dataset);

@@ -563,14 +563,31 @@ where
 fn analyze(cfg: &Config) -> Result<()> {
     cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
-    let t = storage::read_all(&root, "trades")?;
-    let b = storage::read_all(&root, "orderbooks")?;
-    let orderbook_dates: BTreeSet<_> = b
-        .iter()
-        .map(|book: &rustle::model::Orderbook| book.meta.exchange_ts.date_naive())
+    // Orderbooks are the bulk of the archive — ~157M records over a 28-day window at the
+    // measured rate — and nothing after signal building reads them again. So they are read
+    // one UTC partition at a time and dropped, while trades accumulate: outcome matching and
+    // validation both need the whole trade series. The detector is deliberately created once
+    // and held across every chunk; see `analysis::feed_signals`.
+    let mut dates: BTreeSet<NaiveDate> = storage::dataset_dates(&root, "trades")?
+        .into_iter()
         .collect();
-    let s = analysis::build_signals(&t, &b, cfg);
-    drop(b);
+    dates.extend(storage::dataset_dates(&root, "orderbooks")?);
+    let mut detector = analysis::SignalDetector::new(cfg);
+    let mut t: Vec<rustle::model::Trade> = vec![];
+    let mut s: Vec<Signal> = vec![];
+    let mut orderbook_dates: BTreeSet<NaiveDate> = BTreeSet::new();
+    for date in dates {
+        let day_trades: Vec<rustle::model::Trade> = storage::read_date(&root, "trades", date)?;
+        let day_books: Vec<rustle::model::Orderbook> =
+            storage::read_date(&root, "orderbooks", date)?;
+        orderbook_dates.extend(day_books.iter().map(|b| b.meta.exchange_ts.date_naive()));
+        s.extend(analysis::feed_signals(
+            &mut detector,
+            &day_trades,
+            &day_books,
+        ));
+        t.extend(day_trades);
+    }
     // Signals are derived artefacts. Replace them so a repeated analyze is deterministic.
     storage::clear_dataset(&root, "signals")?;
     let audit = analysis::evaluate_with_audit(&s, &t, &orderbook_dates, cfg)?;

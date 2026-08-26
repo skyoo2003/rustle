@@ -409,6 +409,21 @@ struct SelectedCandidate<'a> {
     train_controls: Vec<bool>,
 }
 pub fn build_signals(trades: &[Trade], books: &[Orderbook], cfg: &Config) -> Vec<Signal> {
+    feed_signals(&mut SignalDetector::new(cfg), trades, books)
+}
+
+/// Drive one chunk of already-collected data through a detector the caller owns.
+///
+/// `analyze` reads the archive one UTC partition at a time, so the detector must outlive
+/// the chunk: rolling windows and the `active_rules` edge-tracking that decides whether a
+/// signal fires at all do not reset at midnight during live collection, and must not reset
+/// here either. Passing a fresh detector per chunk re-arms every active rule on every
+/// market at every boundary.
+pub fn feed_signals(
+    detector: &mut SignalDetector,
+    trades: &[Trade],
+    books: &[Orderbook],
+) -> Vec<Signal> {
     let mut trades: Vec<&Trade> = trades.iter().collect();
     let mut books: Vec<&Orderbook> = books.iter().collect();
     trades.sort_by(|a, b| trade_cmp(a, b));
@@ -425,7 +440,6 @@ pub fn build_signals(trades: &[Trade], books: &[Orderbook], cfg: &Config) -> Vec
         )
         .collect();
     events.sort_by_key(|event| (event.0, event.1, event.2));
-    let mut detector = SignalDetector::new(cfg);
     let mut out = vec![];
     for (_, is_trade, i) in events {
         if is_trade {

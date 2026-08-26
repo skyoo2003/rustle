@@ -143,7 +143,7 @@ fn chunked_and_whole_archive_signal_streams_are_identical() {
     let mut all_books = vec![];
     for (i, day) in days.iter().enumerate() {
         for hour in 0..6u32 {
-            let swing = if (hour as usize + i) % 2 == 0 {
+            let swing = if (hour as usize + i).is_multiple_of(2) {
                 900.0
             } else {
                 100.0
