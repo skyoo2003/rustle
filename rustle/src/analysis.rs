@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    model::{ConnectionEvent, Meta, Orderbook, Side, Signal, SignalOutcome, Trade},
+    model::{AlertEvent, ConnectionEvent, Meta, Orderbook, Side, Signal, SignalOutcome, Trade},
 };
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -63,7 +63,12 @@ pub struct EvaluationAudit {
 /// A deterministic fingerprint of every configuration value that can affect collection,
 /// detection, replay, or validation.
 pub fn config_fingerprint(cfg: &Config) -> String {
-    let bytes = serde_json::to_vec(cfg).expect("config serializes");
+    let mut value = serde_json::to_value(cfg).expect("config serializes");
+    value
+        .as_object_mut()
+        .expect("config serializes as an object")
+        .remove("alert");
+    let bytes = serde_json::to_vec(&value).expect("config value serializes");
     let hash = bytes.into_iter().fold(0xcbf29ce484222325u64, |h, byte| {
         (h ^ u64::from(byte)).wrapping_mul(0x100000001b3)
     });
@@ -252,9 +257,11 @@ impl SignalDetector {
                     value,
                     baseline,
                     format!(
-                        "aggressive notional {:.0} is {:.1}x rolling mean",
+                        "aggressive notional {:.0} is {:.1}x rolling mean (threshold {:.1}x over {} trades)",
                         value,
-                        value / baseline
+                        value / baseline,
+                        m,
+                        s.trades.len()
                     ),
                     rule,
                     serde_json::json!({
@@ -281,7 +288,13 @@ impl SignalDetector {
                     t.side,
                     rate,
                     base,
-                    format!("{} trades in rolling window", prior),
+                    format!(
+                        "{} trades in {}s window = {:.1}x the 5-trade baseline (threshold {:.1}x)",
+                        prior,
+                        self.cfg.trade_rate_window_seconds,
+                        rate / base,
+                        m
+                    ),
                     rule,
                     serde_json::json!({
                         "source":"trade", "trigger": t,
@@ -317,7 +330,12 @@ impl SignalDetector {
                     direction,
                     value,
                     0.0,
-                    format!("bid/ask size imbalance {:.3}", value),
+                    format!(
+                        "bid/ask size imbalance {:.3} (threshold {:.2}, {}-heavy)",
+                        value,
+                        th,
+                        if value > 0.0 { "bid" } else { "ask" }
+                    ),
                     rule,
                     serde_json::json!({
                         "source":"orderbook", "total_bid_size": b.total_bid_size,
@@ -356,7 +374,14 @@ impl SignalDetector {
                     oldside,
                     wall,
                     old,
-                    format!("previous {:.0} KRW {:?} wall disappeared", old, oldside),
+                    format!(
+                        "{:.0} KRW {:?} wall fell to {:.0} ({:.0}% drop, qualifying floor {:.0} KRW)",
+                        old,
+                        oldside,
+                        wall,
+                        (1.0 - wall / old) * 100.0,
+                        self.cfg.wall_min_krw
+                    ),
                     "wall-drop".into(),
                     serde_json::json!({
                         "source":"orderbook", "total_bid_size": b.total_bid_size,
@@ -456,6 +481,11 @@ fn signal(
     rule: String,
     evidence: serde_json::Value,
 ) -> Signal {
+    assert!(
+        !rationale.trim().is_empty(),
+        "signal rationale must not be empty"
+    );
+    assert!(!evidence.is_null(), "signal evidence must not be null");
     Signal {
         market_snapshot: serde_json::json!({"market":meta.market,"exchange_ts":meta.exchange_ts,"feature":value,"baseline":baseline,"evidence":evidence}),
         meta,
@@ -905,6 +935,43 @@ pub fn render_csv_report(audit: &EvaluationAudit) -> String {
         } else {
             output.push_str(",,,,,,,,\n");
         }
+    }
+    output
+}
+
+pub fn render_alert(event: &AlertEvent) -> String {
+    let direction = match event.signal.direction {
+        Side::Buy => "BUY",
+        Side::Sell => "SELL",
+    };
+    let mut output = format!(
+        "ALERT {}  {}  {}  {}\n  why:   {}\n  rule:  {}\n",
+        event.signal.meta.exchange_ts.to_rfc3339(),
+        event.signal.meta.market,
+        direction,
+        event.signal.signal_type,
+        event.signal.rationale,
+        event.rule_key,
+    );
+    if let Some(result) = &event.validation {
+        writeln!(
+            output,
+            "  track: validation n={}, hit {:.1}% vs {:.1}% matched-random, lift {:+.1}%,\n         corrected CI [{:+.1}%, {:+.1}%], retention {:.1}%\n         tuned {}–{}, validated {}–{}",
+            result.validation_count,
+            result.validation_hit_rate * 100.0,
+            result.random_hit_rate * 100.0,
+            result.lift * 100.0,
+            result.ci_low * 100.0,
+            result.ci_high * 100.0,
+            result.retention * 100.0,
+            result.tuning_start,
+            result.tuning_end,
+            result.validation_start,
+            result.validation_end,
+        )
+        .expect("writing to String cannot fail");
+    } else {
+        output.push_str("  track: validation record unavailable\n");
     }
     output
 }
@@ -1386,6 +1453,88 @@ mod milestone_two_tests {
         passing.results[0].passed = true;
         let markdown = render_markdown_report(&passing).unwrap();
         assert_eq!(markdown.lines().last(), Some("GATE: PASS — synthetic:a"));
+    }
+
+    #[test]
+    fn alert_renderer_includes_reason_and_validation_track_record() {
+        let mut audit = audit_fixture();
+        audit.results[0].passed = true;
+        let at = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap();
+        let event = AlertEvent {
+            emitted_at: at,
+            rule_key: "synthetic:a".into(),
+            signal: signal(at),
+            validation: Some(audit.results[0].clone()),
+        };
+
+        let rendered = render_alert(&event);
+        assert!(rendered.contains("ALERT 2025-01-29T12:00:00+00:00  KRW-TEST  BUY  synthetic"));
+        assert!(rendered.contains("why:   test"));
+        assert!(rendered.contains("validation n=20, hit 50.0% vs 45.0% matched-random"));
+        assert!(rendered.contains("corrected CI [+0.0%, +10.0%]"));
+        assert!(rendered.contains("tuned 2025-01-01–2025-01-14"));
+
+        let json = serde_json::to_string(&event).unwrap();
+        let round_trip: AlertEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip.validation.unwrap().rule_id, "synthetic:a");
+    }
+
+    #[test]
+    fn alert_renderer_plainly_marks_missing_validation() {
+        let at = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap();
+        let event = AlertEvent {
+            emitted_at: at,
+            rule_key: "synthetic:candidate".into(),
+            signal: signal(at),
+            validation: None,
+        };
+        assert!(render_alert(&event).contains("validation record unavailable"));
+    }
+
+    #[test]
+    fn alert_config_does_not_change_validation_fingerprint() {
+        let cfg = Config::default();
+        let original = config_fingerprint(&cfg);
+        let mut changed_alert = cfg.clone();
+        changed_alert.alert.cooldown_seconds = 0;
+        assert_eq!(config_fingerprint(&changed_alert), original);
+
+        let mut changed_validation = cfg;
+        changed_validation.validation.horizon_minutes += 1;
+        assert_ne!(config_fingerprint(&changed_validation), original);
+    }
+
+    #[test]
+    #[should_panic(expected = "signal rationale must not be empty")]
+    fn signal_constructor_rejects_empty_rationale() {
+        let at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let meta = trade(1, 0, 1.0).meta;
+        super::signal(
+            meta,
+            "synthetic",
+            Side::Buy,
+            1.0,
+            0.0,
+            "  ".into(),
+            "candidate".into(),
+            serde_json::json!({"at": at}),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "signal evidence must not be null")]
+    fn signal_constructor_rejects_null_evidence() {
+        let meta = trade(1, 0, 1.0).meta;
+        super::signal(
+            meta,
+            "synthetic",
+            Side::Buy,
+            1.0,
+            0.0,
+            "test".into(),
+            "candidate".into(),
+            serde_json::Value::Null,
+        );
     }
 
     #[test]

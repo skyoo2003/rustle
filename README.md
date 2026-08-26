@@ -80,6 +80,25 @@ The MVP procedure is a hard gate:
 
 If no rule passes, alerting and paper trading remain blocked: revise the rules or stop the project. `analyze` replaces its derived `signals`, `signal_outcomes`, evaluation, and active-ruleset files so reruns cannot accumulate stale results.
 
+## Alerts
+
+Every qualified alert explains the observed condition and threshold, identifies the exact rule, and
+includes that rule's out-of-sample validation count, hit rate, matched-random rate, lift, corrected
+confidence interval, retention, and tuning/validation dates. Human-readable output is the default;
+use `alert --json` for one complete `AlertEvent` JSON object per line.
+
+Live alerts from `collect --emit-alerts` are printed to stdout and appended immediately to
+`data/alerts/date=YYYY-MM-DD/events.jsonl`. They remain local by design and can be watched with:
+
+```sh
+tail -f data/alerts/date=*/events.jsonl
+```
+
+`[alert] cooldown_seconds` defaults to 900. It suppresses repeat delivery for the same market and
+rule until the cooldown expires; set it to `0` to disable suppression. Cooldown never suppresses
+detection: every detected signal is still persisted in `live_signals`, including signals for which
+alert delivery was suppressed or failed.
+
 The generated config uses 10,000 bootstrap iterations and enables
 `validation.family_wise_correction` by default; set it to `false` only when an explicitly
 uncorrected analysis is intended. `validation.entry_max_lag_seconds` must be non-negative.

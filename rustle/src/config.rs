@@ -19,6 +19,8 @@ pub struct Config {
     pub wall_min_krw: f64,
     pub candidate: CandidateConfig,
     pub validation: ValidationConfig,
+    #[serde(default)]
+    pub alert: AlertConfig,
     pub paper: PaperConfig,
 }
 fn default_stall_timeout_seconds() -> i64 {
@@ -74,6 +76,21 @@ pub struct PaperConfig {
     pub fee_bps: f64,
     pub slippage_bps: f64,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertConfig {
+    #[serde(default = "default_alert_cooldown_seconds")]
+    pub cooldown_seconds: i64,
+}
+fn default_alert_cooldown_seconds() -> i64 {
+    900
+}
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            cooldown_seconds: default_alert_cooldown_seconds(),
+        }
+    }
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -102,6 +119,7 @@ impl Default for Config {
                 bootstrap_iterations: 10_000,
                 bootstrap_seed: 7,
             },
+            alert: AlertConfig::default(),
             paper: PaperConfig {
                 fee_bps: 5.0,
                 slippage_bps: 3.0,
@@ -130,6 +148,9 @@ impl Config {
         if self.validation.entry_max_lag_seconds < 0 {
             anyhow::bail!("entry_max_lag_seconds must be non-negative");
         }
+        if self.alert.cooldown_seconds < 0 {
+            anyhow::bail!("alert.cooldown_seconds must be non-negative");
+        }
         Ok(())
     }
 }
@@ -144,6 +165,7 @@ mod tests {
         let table = value.as_table_mut().unwrap();
         table.remove("stall_timeout_seconds");
         table.remove("flush_interval_seconds");
+        table.remove("alert");
         table
             .get_mut("validation")
             .unwrap()
@@ -155,6 +177,7 @@ mod tests {
 
         assert_eq!(loaded.stall_timeout_seconds, 90);
         assert_eq!(loaded.flush_interval_seconds, 30);
+        assert_eq!(loaded.alert.cooldown_seconds, 900);
         assert!(loaded.validation.family_wise_correction);
     }
 
@@ -188,5 +211,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("entry_max_lag_seconds"));
+    }
+
+    #[test]
+    fn alert_cooldown_must_be_non_negative_but_zero_disables_it() {
+        let mut cfg = Config::default();
+        cfg.alert.cooldown_seconds = -1;
+        assert!(cfg
+            .validate_collection_intervals()
+            .unwrap_err()
+            .to_string()
+            .contains("alert.cooldown_seconds"));
+
+        cfg.alert.cooldown_seconds = 0;
+        cfg.validate_collection_intervals().unwrap();
     }
 }
