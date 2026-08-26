@@ -33,6 +33,193 @@ fn normalization_preserves_exchange_and_receive_times() {
         _ => panic!(),
     }
 }
+/// A trade on `date` for `market`, priced so signal fixtures can drive thresholds.
+fn trade_on(date: NaiveDate, hour: u32, market: &str, price: f64) -> Trade {
+    let exchange_ts = Utc.from_utc_datetime(&date.and_hms_opt(hour, 0, 0).unwrap());
+    Trade {
+        meta: Meta {
+            schema_version: SCHEMA_VERSION,
+            market: market.into(),
+            exchange_ts,
+            receive_ts: exchange_ts,
+        },
+        price,
+        volume: 1.0,
+        side: Side::Buy,
+        sequential_id: None,
+    }
+}
+
+fn book_on(date: NaiveDate, hour: u32, market: &str, bid: f64, ask: f64) -> Orderbook {
+    let exchange_ts = Utc.from_utc_datetime(&date.and_hms_opt(hour, 0, 0).unwrap());
+    Orderbook {
+        meta: Meta {
+            schema_version: SCHEMA_VERSION,
+            market: market.into(),
+            exchange_ts,
+            receive_ts: exchange_ts,
+        },
+        total_bid_size: bid,
+        total_ask_size: ask,
+        levels: vec![Level {
+            ask_price: 100.0,
+            bid_price: 99.0,
+            ask_size: ask,
+            bid_size: bid,
+        }],
+    }
+}
+
+#[test]
+fn dataset_dates_lists_partitions_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let days = [
+        NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
+        NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+    ];
+    for day in days {
+        let t = trade_on(day, 12, "KRW-A", 10.0);
+        storage::write(dir.path(), "trades", "KRW-A", t.meta.exchange_ts, &[t]).unwrap();
+    }
+
+    let listed = storage::dataset_dates(dir.path(), "trades").unwrap();
+
+    let mut expected = days;
+    expected.sort();
+    assert_eq!(listed, expected.to_vec());
+    assert!(storage::dataset_dates(dir.path(), "absent")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn read_date_returns_only_that_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+    let second = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+    for (day, price) in [(first, 10.0), (second, 20.0)] {
+        let t = trade_on(day, 12, "KRW-A", price);
+        storage::write(dir.path(), "trades", "KRW-A", t.meta.exchange_ts, &[t]).unwrap();
+    }
+
+    let only_second: Vec<Trade> = storage::read_date(dir.path(), "trades", second).unwrap();
+
+    assert_eq!(only_second.len(), 1);
+    assert_eq!(only_second[0].price, 20.0);
+}
+
+#[test]
+fn a_malformed_partition_name_is_an_error_not_a_silent_skip() {
+    // Silently skipping an unreadable partition would drop a collection day from the
+    // gate window without saying so, which is the one failure mode the gate cannot survive.
+    let dir = tempfile::tempdir().unwrap();
+    let t = trade_on(
+        NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+        12,
+        "KRW-A",
+        10.0,
+    );
+    storage::write(dir.path(), "trades", "KRW-A", t.meta.exchange_ts, &[t]).unwrap();
+    std::fs::create_dir_all(dir.path().join("trades/date=not-a-date")).unwrap();
+
+    let error = storage::dataset_dates(dir.path(), "trades").unwrap_err();
+
+    assert!(
+        error.to_string().contains("not-a-date"),
+        "error must name the bad partition, got: {error}"
+    );
+}
+
+#[test]
+fn chunked_and_whole_archive_signal_streams_are_identical() {
+    // This is the load-bearing assertion of the whole milestone: reading date-by-date
+    // must not change what the gate sees.
+    let cfg = Config::default();
+    let days: Vec<NaiveDate> = (1..=3)
+        .map(|d| NaiveDate::from_ymd_opt(2025, 1, d).unwrap())
+        .collect();
+    let mut all_trades = vec![];
+    let mut all_books = vec![];
+    for (i, day) in days.iter().enumerate() {
+        for hour in 0..6u32 {
+            let swing = if (hour as usize + i) % 2 == 0 {
+                900.0
+            } else {
+                100.0
+            };
+            all_books.push(book_on(*day, hour, "KRW-A", swing, 1000.0 - swing));
+            all_trades.push(trade_on(*day, hour, "KRW-A", 100.0 + hour as f64));
+        }
+    }
+
+    let whole = analysis::build_signals(&all_trades, &all_books, &cfg);
+
+    let mut detector = SignalDetector::new(&cfg);
+    let mut chunked = vec![];
+    for day in &days {
+        let trades: Vec<Trade> = all_trades
+            .iter()
+            .filter(|t| t.meta.exchange_ts.date_naive() == *day)
+            .cloned()
+            .collect();
+        let books: Vec<Orderbook> = all_books
+            .iter()
+            .filter(|b| b.meta.exchange_ts.date_naive() == *day)
+            .cloned()
+            .collect();
+        chunked.extend(analysis::feed_signals(&mut detector, &trades, &books));
+    }
+
+    assert!(!whole.is_empty(), "fixture must actually produce signals");
+    let key = |s: &rustle::model::Signal| {
+        (
+            s.meta.exchange_ts,
+            s.signal_type.clone(),
+            s.rule_id.clone(),
+            s.rationale.clone(),
+        )
+    };
+    assert_eq!(
+        whole.iter().map(key).collect::<Vec<_>>(),
+        chunked.iter().map(key).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_rule_active_at_the_end_of_one_date_does_not_refire_at_the_start_of_the_next() {
+    // Resetting the detector per chunk would re-fire every active rule on every market
+    // at every midnight -- 28 days of phantom signals straight into the gate.
+    let cfg = Config::default();
+    let first = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+    let second = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+    let mut detector = SignalDetector::new(&cfg);
+
+    let day_one = analysis::feed_signals(
+        &mut detector,
+        &[],
+        &[book_on(first, 23, "KRW-A", 950.0, 50.0)],
+    );
+    let day_two = analysis::feed_signals(
+        &mut detector,
+        &[],
+        &[book_on(second, 0, "KRW-A", 950.0, 50.0)],
+    );
+
+    assert!(
+        day_one
+            .iter()
+            .any(|s| s.signal_type == "orderbook_imbalance"),
+        "the imbalance rule must fire on first crossing"
+    );
+    assert!(
+        !day_two
+            .iter()
+            .any(|s| s.signal_type == "orderbook_imbalance"),
+        "a still-active rule must not re-arm across the chunk boundary"
+    );
+}
+
 #[test]
 fn parquet_round_trip_retains_metadata() {
     let dir = tempfile::tempdir().unwrap();
