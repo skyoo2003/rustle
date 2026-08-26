@@ -47,13 +47,23 @@ simulation are available only from a current, persisted validation-qualified rul
 ```sh
 cargo run -p rustle -- init-config
 cargo run -p rustle -- collect --config rustle.toml
-# Stop with Ctrl-C; batches are flushed before exit. Restart the same command to resume.
+cargo run -p rustle -- coverage --config rustle.toml
+# Keep collect running for 28 UTC dates; stop with Ctrl-C to flush, then restart to resume.
 cargo run -p rustle -- analyze --config rustle.toml
 cargo run -p rustle -- report  --config rustle.toml
 cargo run -p rustle -- paper   --config rustle.toml
 ```
 
 Requires a recent stable Rust toolchain (edition 2021).
+
+Collection flushes buffered trades, orderbooks, and live signals every
+`flush_interval_seconds` (30 seconds by default), in addition to size-based flushes. If no
+WebSocket frame arrives within `stall_timeout_seconds` (90 seconds by default), Rustle flushes the
+buffers, records a `stalled` connection event, and reconnects automatically. Both values must be
+positive. Run `collect --config rustle.toml` continuously in a terminal or your existing process
+manager; this repository intentionally does not install a background service. Run `coverage`
+periodically (or `coverage --csv`) to inspect daily counts, markets, disconnects, stalls, connection
+gaps, and progress toward the required 28 contiguous UTC dates.
 
 ## Data layout
 

@@ -5,6 +5,7 @@ use rustle::{
     model::{Level, Meta, Orderbook, Side, Trade, SCHEMA_VERSION},
     storage, upbit,
 };
+use std::process::Command;
 
 fn meta(ms: i64) -> Meta {
     Meta {
@@ -54,6 +55,42 @@ fn parquet_round_trip_retains_metadata() {
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].meta.schema_version, SCHEMA_VERSION);
     assert_eq!(read[0].price, 10.);
+}
+
+#[test]
+fn empty_coverage_cli_prints_a_stable_table_and_zero_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("rustle.toml");
+    let cfg = Config {
+        data_root: dir.path().join("data").display().to_string(),
+        ..Config::default()
+    };
+    std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rustle"))
+        .args(["coverage", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("| UTC date | Trades | Orderbooks |"));
+    assert!(stdout.contains("0 of 28 required contiguous UTC dates present"));
+
+    let csv = Command::new(env!("CARGO_BIN_EXE_rustle"))
+        .args(["coverage", "--csv", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(csv.status.success());
+    assert_eq!(
+        String::from_utf8(csv.stdout).unwrap(),
+        "date,trades,orderbooks,live_signals,markets,disconnected,stalled,total_gap_ms,longest_gap_ms\n"
+    );
+    assert!(String::from_utf8(csv.stderr)
+        .unwrap()
+        .contains("0 of 28 required contiguous UTC dates present"));
 }
 #[test]
 fn wall_cancel_signal_has_evidence() {
