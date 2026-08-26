@@ -147,4 +147,26 @@ mod tests {
         let event: AlertEvent = serde_json::from_value(json).unwrap();
         assert!(event.validation.is_none());
     }
+
+    #[test]
+    fn old_paper_summary_json_defaults_every_milestone_four_field() {
+        let json = serde_json::json!({
+            "generated_at": "2025-01-29T00:00:00Z",
+            "trade_count": 3,
+            "cumulative_net_pnl_pct": 1.5,
+            "win_rate": 0.5
+        });
+
+        let summary: PaperSummary = serde_json::from_value(json).unwrap();
+
+        assert_eq!(summary.trade_count, 3);
+        assert!(summary.window_start.is_none());
+        assert!(summary.window_end.is_none());
+        assert_eq!(summary.market_count, 0);
+        assert_eq!(summary.skipped_overlapping, 0);
+        assert_eq!(summary.incomplete_horizon, 0);
+        assert_eq!(summary.max_drawdown_pct, 0.0);
+        assert_eq!(summary.hodl_pnl_pct, 0.0);
+        assert_eq!(summary.excess_pnl_pct, 0.0);
+    }
 }

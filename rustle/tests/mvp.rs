@@ -1,4 +1,4 @@
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use rustle::{
     analysis::{self, SignalDetector},
     config::Config,
@@ -499,27 +499,21 @@ fn build_signals_is_deterministic_when_inputs_are_reordered() {
 fn paper_exit_is_the_first_trade_at_or_after_the_validated_horizon() {
     let mut cfg = Config::default();
     cfg.validation.horizon_minutes = 30;
-    let signal = rustle::model::Signal {
-        meta: meta(0),
-        signal_type: "x".into(),
-        direction: Side::Buy,
-        feature_value: 1.,
-        baseline: 0.,
-        rationale: "x".into(),
-        market_snapshot: serde_json::json!({}),
-        rule_id: "ok".into(),
-    };
-    let at = |minutes: i64, price: f64| Trade {
-        meta: meta(Duration::minutes(minutes).num_milliseconds()),
-        price,
-        volume: 1.,
-        side: Side::Buy,
-        sequential_id: None,
-    };
-    let tr = vec![at(0, 100.), at(15, 110.), at(30, 120.)];
-    let p = analysis::paper(&[signal], &tr, &["x:ok".into()], &cfg);
+    let trades = vec![
+        dated_trade(14, 0, 100.0),
+        dated_trade(14, 15, 110.0),
+        dated_trade(14, 30, 120.0),
+    ];
+
+    let report = paper_study(
+        &[candidate(14, 0, "ok")],
+        &trades,
+        &["synthetic:ok".into()],
+        &cfg,
+    );
+
     assert_eq!(
-        p[0].exit_price, 120.,
+        report.trades[0].exit_price, 120.0,
         "paper must hold for validation.horizon_minutes, not a hardcoded 15"
     );
 }
@@ -527,21 +521,186 @@ fn paper_exit_is_the_first_trade_at_or_after_the_validated_horizon() {
 #[test]
 fn paper_only_uses_the_validation_qualified_signal_type_and_rule() {
     let cfg = Config::default();
-    let mut qualified = candidate(0, 0, "shared");
+    let mut qualified = candidate(14, 0, "shared");
     qualified.signal_type = "qualified".into();
     let mut unqualified = qualified.clone();
     unqualified.signal_type = "unqualified".into();
-    let trades = vec![dated_trade(0, 0, 100.0), dated_trade(0, 15, 101.0)];
+    let trades = vec![dated_trade(14, 0, 100.0), dated_trade(14, 15, 101.0)];
 
-    let paper = analysis::paper(
+    let report = paper_study(
         &[qualified, unqualified],
         &trades,
         &["qualified:shared".into()],
         &cfg,
     );
 
-    assert_eq!(paper.len(), 1);
-    assert_eq!(paper[0].signal.signal_type, "qualified");
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].signal.signal_type, "qualified");
+}
+
+#[test]
+fn paper_simulates_validation_days_only_and_ignores_the_tuning_days() {
+    let cfg = Config::default();
+    let trades = vec![
+        // Tuning days. A rule was *chosen* on these, so its P&L here restates the selection.
+        dated_trade(0, 0, 500.0),
+        dated_trade(0, 15, 550.0),
+        dated_trade(14, 0, 100.0),
+        dated_trade(14, 15, 110.0),
+    ];
+    let signals = vec![candidate(0, 0, "r"), candidate(14, 0, "r")];
+
+    let report = paper_study(&signals, &trades, &["synthetic:r".into()], &cfg);
+
+    assert_eq!(
+        report.trades.len(),
+        1,
+        "the tuning-day signal must not produce a paper trade"
+    );
+    assert_eq!(
+        report.trades[0].signal.meta.exchange_ts.date_naive(),
+        NaiveDate::from_ymd_opt(2025, 1, 15).unwrap()
+    );
+    assert_eq!(report.summary.window_start, Some(validation_window().0));
+    assert_eq!(report.summary.window_end, Some(validation_window().1));
+    assert!(
+        (report.summary.hodl_pnl_pct - (10.0 - ROUND_TRIP_PCT)).abs() < 1e-9,
+        "hold must open at the first in-window price, not the first price ever collected"
+    );
+}
+
+#[test]
+fn a_market_holds_one_position_at_a_time_and_counts_the_overlapping_signal() {
+    let cfg = Config::default();
+    let trades = vec![
+        dated_trade(14, 0, 100.0),
+        dated_trade(14, 5, 105.0),
+        dated_trade(14, 15, 110.0),
+        dated_trade(14, 20, 115.0),
+    ];
+    let signals = vec![candidate(14, 0, "r"), candidate(14, 5, "r")];
+
+    let report = paper_study(&signals, &trades, &["synthetic:r".into()], &cfg);
+
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].exit_price, 110.0);
+    assert_eq!(report.summary.skipped_overlapping, 1);
+    assert_eq!(report.summary.trade_count, 1);
+}
+
+#[test]
+fn sequential_wins_on_one_market_compound_instead_of_summing() {
+    let cfg = Config::default();
+    let trades = vec![
+        dated_trade(14, 0, 100.0),
+        dated_trade(14, 15, 110.0),
+        dated_trade(14, 30, 121.0),
+    ];
+    let signals = vec![candidate(14, 0, "r"), candidate(14, 15, "r")];
+
+    let report = paper_study(&signals, &trades, &["synthetic:r".into()], &cfg);
+
+    assert_eq!(report.trades.len(), 2);
+    assert_eq!(report.summary.skipped_overlapping, 0);
+    let net = 10.0 - ROUND_TRIP_PCT;
+    let compounded = ((1.0 + net / 100.0).powi(2) - 1.0) * 100.0;
+    assert!(
+        (report.summary.cumulative_net_pnl_pct - compounded).abs() < 1e-9,
+        "expected {compounded:.6}, got {:.6}",
+        report.summary.cumulative_net_pnl_pct
+    );
+    assert!(
+        (report.summary.cumulative_net_pnl_pct - 2.0 * net).abs() > 0.9,
+        "a sum of per-trade percentages would have reported {:.4}",
+        2.0 * net
+    );
+}
+
+#[test]
+fn markets_are_equally_weighted_whatever_each_sleeve_returned() {
+    let cfg = Config::default();
+    let trades = vec![
+        market_trade("KRW-A", 14, 0, 100.0),
+        market_trade("KRW-A", 14, 15, 110.0),
+        market_trade("KRW-B", 14, 0, 100.0),
+        market_trade("KRW-B", 14, 15, 90.0),
+    ];
+    let signals = vec![
+        market_candidate("KRW-A", 14, 0, "r"),
+        market_candidate("KRW-B", 14, 0, "r"),
+    ];
+
+    let report = paper_study(&signals, &trades, &["synthetic:r".into()], &cfg);
+
+    assert_eq!(report.summary.market_count, 2);
+    // +10% and -10% gross cancel, so what is left is one round trip on each sleeve.
+    assert!((report.summary.cumulative_net_pnl_pct + ROUND_TRIP_PCT).abs() < 1e-9);
+    assert_eq!(report.markets.len(), 2);
+    assert_eq!(report.markets[0].market, "KRW-A");
+    assert!((report.markets[0].net_pnl_pct - (10.0 - ROUND_TRIP_PCT)).abs() < 1e-9);
+    assert_eq!(report.markets[1].market, "KRW-B");
+    assert!((report.markets[1].net_pnl_pct - (-10.0 - ROUND_TRIP_PCT)).abs() < 1e-9);
+}
+
+#[test]
+fn hold_benchmark_buys_at_window_open_sells_at_window_close_and_pays_one_round_trip() {
+    let cfg = Config::default();
+    let trades = vec![
+        // Outside the validation window; must not anchor the hold benchmark.
+        market_trade("KRW-A", 0, 0, 1_000.0),
+        market_trade("KRW-B", 0, 0, 2_000.0),
+        market_trade("KRW-A", 14, 0, 100.0),
+        market_trade("KRW-A", 14, 15, 110.0),
+        market_trade("KRW-A", 27, 0, 110.0),
+        market_trade("KRW-B", 14, 0, 100.0),
+        market_trade("KRW-B", 27, 0, 105.0),
+    ];
+
+    let report = paper_study(
+        &[market_candidate("KRW-A", 14, 0, "r")],
+        &trades,
+        &["synthetic:r".into()],
+        &cfg,
+    );
+
+    let a_hold = 10.0 - ROUND_TRIP_PCT;
+    let b_hold = 5.0 - ROUND_TRIP_PCT;
+    assert!((report.summary.hodl_pnl_pct - (a_hold + b_hold) / 2.0).abs() < 1e-9);
+    assert!((report.markets[0].hodl_pnl_pct - a_hold).abs() < 1e-9);
+    assert!((report.markets[1].hodl_pnl_pct - b_hold).abs() < 1e-9);
+
+    // The strategy pays a round trip per trade; hold pays exactly one for the whole window.
+    assert_eq!(report.trades.len(), 1);
+    assert!((report.trades[0].gross_pnl_pct - 10.0).abs() < 1e-9);
+    assert!((report.trades[0].net_pnl_pct - (10.0 - ROUND_TRIP_PCT)).abs() < 1e-9);
+    // KRW-B fired no signal, so its equally weighted sleeve sat in cash at 0%.
+    assert!((report.summary.cumulative_net_pnl_pct - (10.0 - ROUND_TRIP_PCT) / 2.0).abs() < 1e-9);
+    assert!(
+        (report.summary.excess_pnl_pct
+            - (report.summary.cumulative_net_pnl_pct - report.summary.hodl_pnl_pct))
+            .abs()
+            < 1e-12
+    );
+    assert!(report.summary.excess_pnl_pct < 0.0, "hold wins this fixture");
+}
+
+#[test]
+fn a_signal_whose_horizon_runs_past_the_last_trade_is_counted_not_traded() {
+    let cfg = Config::default();
+    let trades = vec![dated_trade(14, 0, 100.0)];
+
+    let report = paper_study(
+        &[candidate(14, 0, "r")],
+        &trades,
+        &["synthetic:r".into()],
+        &cfg,
+    );
+
+    assert!(report.trades.is_empty());
+    assert_eq!(report.summary.incomplete_horizon, 1);
+    assert_eq!(report.summary.trade_count, 0);
+    assert_eq!(report.summary.win_rate, 0.0);
+    assert_eq!(report.summary.cumulative_net_pnl_pct, 0.0);
 }
 
 #[test]
@@ -569,31 +728,42 @@ fn exact_timestamp_entries_use_the_explicit_sequence_tiebreaker() {
 }
 
 #[test]
-fn sell_paper_trade_uses_a_long_only_benchmark() {
+fn a_sell_signal_profits_when_price_falls_and_still_pays_the_round_trip() {
     let cfg = Config::default();
-    let mut signal = candidate(0, 0, "sell");
+    let mut signal = candidate(14, 0, "sell");
     signal.direction = Side::Sell;
-    let trades = vec![dated_trade(0, 0, 100.), dated_trade(0, 15, 90.)];
-    let paper = analysis::paper(&[signal], &trades, &["synthetic:sell".into()], &cfg);
-    assert!((paper[0].long_only_benchmark_pnl_pct + 10.).abs() < 1e-9);
-    assert!(paper[0].gross_pnl_pct > 0.);
+    let trades = vec![dated_trade(14, 0, 100.), dated_trade(14, 15, 90.)];
+
+    let report = paper_study(&[signal], &trades, &["synthetic:sell".into()], &cfg);
+
+    let gross = (100.0 / 90.0 - 1.0) * 100.0;
+    assert!((report.trades[0].gross_pnl_pct - gross).abs() < 1e-9);
+    assert!((report.trades[0].net_pnl_pct - (gross - ROUND_TRIP_PCT)).abs() < 1e-9);
+    // Holding this market over the same window lost money; following the side did not.
+    assert!(report.summary.hodl_pnl_pct < 0.0);
+    assert!(report.summary.cumulative_net_pnl_pct > 0.0);
+    assert!(report.summary.excess_pnl_pct > 0.0);
 }
 
-fn dated_meta(day: i64, minute: i64) -> Meta {
+fn market_meta(market: &str, day: i64, minute: i64) -> Meta {
     let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap()
         + Duration::days(day)
         + Duration::minutes(minute);
     Meta {
         schema_version: SCHEMA_VERSION,
-        market: "KRW-TEST".into(),
+        market: market.into(),
         exchange_ts: ts,
         receive_ts: ts,
     }
 }
 
-fn dated_trade(day: i64, minute: i64, price: f64) -> Trade {
+fn dated_meta(day: i64, minute: i64) -> Meta {
+    market_meta("KRW-TEST", day, minute)
+}
+
+fn market_trade(market: &str, day: i64, minute: i64, price: f64) -> Trade {
     Trade {
-        meta: dated_meta(day, minute),
+        meta: market_meta(market, day, minute),
         price,
         volume: 1.0,
         side: Side::Buy,
@@ -601,9 +771,13 @@ fn dated_trade(day: i64, minute: i64, price: f64) -> Trade {
     }
 }
 
-fn candidate(day: i64, minute: i64, rule_id: &str) -> rustle::model::Signal {
+fn dated_trade(day: i64, minute: i64, price: f64) -> Trade {
+    market_trade("KRW-TEST", day, minute, price)
+}
+
+fn market_candidate(market: &str, day: i64, minute: i64, rule_id: &str) -> rustle::model::Signal {
     rustle::model::Signal {
-        meta: dated_meta(day, minute),
+        meta: market_meta(market, day, minute),
         signal_type: "synthetic".into(),
         direction: Side::Buy,
         feature_value: 1.0,
@@ -612,6 +786,37 @@ fn candidate(day: i64, minute: i64, rule_id: &str) -> rustle::model::Signal {
         market_snapshot: serde_json::json!({}),
         rule_id: rule_id.into(),
     }
+}
+
+fn candidate(day: i64, minute: i64, rule_id: &str) -> rustle::model::Signal {
+    market_candidate("KRW-TEST", day, minute, rule_id)
+}
+
+/// Default `[paper]` costs: one round trip of 2 x (5 fee bps + 3 slippage bps).
+const ROUND_TRIP_PCT: f64 = 0.16;
+
+/// Days 15-28 of the fixture calendar, i.e. `dated_*` days 14 through 27.
+fn validation_window() -> (NaiveDate, NaiveDate) {
+    (
+        NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
+        NaiveDate::from_ymd_opt(2025, 1, 28).unwrap(),
+    )
+}
+
+fn paper_study(
+    signals: &[rustle::model::Signal],
+    trades: &[Trade],
+    passed: &[String],
+    cfg: &Config,
+) -> analysis::PaperReport {
+    analysis::paper(
+        signals,
+        trades,
+        passed,
+        validation_window(),
+        Utc.with_ymd_and_hms(2025, 1, 29, 0, 0, 0).unwrap(),
+        cfg,
+    )
 }
 
 fn twenty_eight_days_of_trades() -> Vec<Trade> {
