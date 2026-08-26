@@ -76,7 +76,7 @@ The MVP procedure is a hard gate:
 1. Collect continuously for 28 consecutive UTC dates. Raw `trades` and `orderbooks` are never replaced; sequence anomalies and connection gaps are recorded separately.
 2. Run `analyze`. It deterministically regenerates candidate signals and 15-minute outcomes from raw data, uses days 1–14 to tune one rule per signal type, and leaves days 15–28 untouched for validation.
 3. A rule passes only when it has the minimum validation sample, the lower bound of its family-wise-corrected paired-bootstrap CI is positive, and its out-of-sample hit rate retains at least 80% of its tuning hit rate. Bonferroni family-wise correction is enabled by default across selected signal types. The complete audit—including every tuning candidate, its matched-random result, selection status, effective alpha, and retention—and a full configuration fingerprint are persisted with the versioned active ruleset.
-4. Only then use `collect --emit-alerts`, `alert`, `report`, and `paper`. Each consumes that same persisted audit/ruleset and blocks when its exact configuration fingerprint or validated collection window is stale. Paper entries must occur within 60 seconds by default; output includes fees, slippage, win rate, cumulative net P&L, and a long-only benchmark (buy at each simulated entry and sell at its exit regardless of signal side).
+4. Only then use `collect --emit-alerts`, `alert`, `report`, and `paper`. Each consumes that same persisted audit/ruleset and blocks when its exact configuration fingerprint or validated collection window is stale. Paper entries must occur within 60 seconds by default; see [Paper study](#paper-study) for what the P&L number is and what it is compared against.
 
 If no rule passes, alerting and paper trading remain blocked: revise the rules or stop the project. `analyze` replaces its derived `signals`, `signal_outcomes`, evaluation, and active-ruleset files so reruns cannot accumulate stale results.
 
@@ -107,6 +107,43 @@ candidate table, and always ends with an explicit `GATE: PASS` or `GATE: FAIL` v
 `report --csv` emits one row per candidate with the fixed schema
 `signal_type,rule_id,selected,tuning_start,tuning_end,validation_start,validation_end,train_count,train_hit_rate,train_random_hit_rate,validation_count,validation_hit_rate,random_hit_rate,lift,ci_low,ci_high,retention,passed`;
 validation fields are blank for candidates that were not selected.
+
+## Paper study
+
+`paper` replays the qualified ruleset over **the validation window only** — the untouched
+days 15–28. Days 1–14 are the days each rule was *chosen* on, so a profitable P&L there is
+the selection procedure working, not the rule.
+
+The capital model is one rule: capital is split equally across every market that traded in
+the window, and each market's sleeve compounds independently while holding **at most one
+position at a time**. A qualified signal that arrives while its market is already in a
+position is skipped and counted, not stacked — summing overlapping percentage returns would
+quietly assume you had capital for all of them at once. Positions exit at
+`validation.horizon_minutes`, the same horizon the gate validated.
+
+The benchmark is a real hold: buy every market in that same universe at its first in-window
+price, sell at its last, equal weight, less **one** round trip of `fee_bps + slippage_bps`.
+The strategy pays that round trip on *every* trade. That asymmetry is the comparison.
+
+**Caveat, printed in the report and not only here:** the universe refreshes daily to the top
+20 markets by volume, so markets that fell out are absent from later dates. That survivorship
+bias favours hold — beating this benchmark is a stronger result than the raw gap suggests,
+and losing to it a weaker one.
+
+Both outputs end in an explicit verdict line naming the winner and the gap:
+
+```text
+VERDICT: HOLD WINS by 0.790pp over 2025-01-15–2025-01-28
+```
+
+`paper --csv` emits one row per rule and per market plus a `total` row, with the fixed schema
+`section,key,trades,skipped_overlapping,incomplete_horizon,win_rate,net_pnl_pct,mean_pnl_pct,max_drawdown_pct,hodl_pnl_pct`;
+`hodl_pnl_pct` is blank for rule rows because you cannot hold a rule, and the same `VERDICT:`
+line trails the rows. The persisted summary also records the window, market count, skipped and
+incomplete counts, max drawdown, and the excess over hold, so the headline can be argued with.
+
+Deliberately not modelled — see `docs/adr/0005-paper-capital-model.md`: partial fills, queue
+position, cross-market reallocation, confidence-weighted sizing, and stop-losses.
 
 ## Status
 

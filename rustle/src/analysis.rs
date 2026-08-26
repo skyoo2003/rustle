@@ -544,6 +544,27 @@ impl<'a> TradeIndex<'a> {
                 on_date.partition_point(|trade| trade.meta.exchange_ts <= cutoff)
             })
     }
+    /// Every market that traded inside the inclusive UTC date window, with its first and
+    /// last in-window price.  Sorted, so both the equal weighting and the report are stable.
+    fn window_universe(&self, start: NaiveDate, end: NaiveDate) -> Vec<(&'a str, f64, f64)> {
+        let from = start.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+        let to = (end + Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
+        let mut universe: Vec<_> = self
+            .by_market
+            .iter()
+            .filter_map(|(market, values)| {
+                let first = values.partition_point(|trade| trade.meta.exchange_ts < from);
+                let last = values.partition_point(|trade| trade.meta.exchange_ts < to);
+                let in_window = values.get(first..last)?;
+                Some((*market, in_window.first()?.price, in_window.last()?.price))
+            })
+            .collect();
+        universe.sort_by_key(|(market, ..)| *market);
+        universe
+    }
     fn between(&self, market: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> &[&'a Trade] {
         let Some(values) = self.by_market.get(market) else {
             return &[];
@@ -1076,39 +1097,643 @@ pub fn render_markdown_report(audit: &EvaluationAudit) -> Result<String> {
     Ok(output)
 }
 
+#[derive(Debug, Clone)]
+pub struct PaperRuleRow {
+    pub rule_key: String,
+    pub trade_count: usize,
+    pub skipped_overlapping: usize,
+    pub incomplete_horizon: usize,
+    pub win_rate: f64,
+    /// Compounded return of a sleeve that took only this rule's trades.
+    pub net_pnl_pct: f64,
+    pub mean_pnl_pct: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaperMarketRow {
+    pub market: String,
+    pub trade_count: usize,
+    pub skipped_overlapping: usize,
+    pub incomplete_horizon: usize,
+    pub win_rate: f64,
+    /// Compounded return of this market's equally weighted sleeve.
+    pub net_pnl_pct: f64,
+    pub mean_pnl_pct: f64,
+    pub hodl_pnl_pct: f64,
+}
+
+/// Everything `paper` produced, ready to persist or render.  The window and costs travel
+/// with it so a renderer never has to reach back into the config to label its own output.
+#[derive(Debug, Clone)]
+pub struct PaperReport {
+    pub summary: crate::model::PaperSummary,
+    pub trades: Vec<crate::model::PaperTrade>,
+    pub rules: Vec<PaperRuleRow>,
+    pub markets: Vec<PaperMarketRow>,
+    pub window: (NaiveDate, NaiveDate),
+    pub horizon_minutes: i64,
+    pub fee_bps: f64,
+    pub slippage_bps: f64,
+}
+
+/// Running counts for one slice of the study (a rule, a market, or the whole thing).
+#[derive(Debug, Clone)]
+struct Tally {
+    trade_count: usize,
+    skipped_overlapping: usize,
+    incomplete_horizon: usize,
+    wins: usize,
+    net_sum: f64,
+    /// Compounding multiplier, so two 10% winners make 21%, not 20%.
+    sleeve: f64,
+}
+
+impl Tally {
+    fn new() -> Self {
+        Self {
+            trade_count: 0,
+            skipped_overlapping: 0,
+            incomplete_horizon: 0,
+            wins: 0,
+            net_sum: 0.0,
+            sleeve: 1.0,
+        }
+    }
+
+    fn fill(&mut self, net_pnl_pct: f64) {
+        self.trade_count += 1;
+        self.wins += usize::from(net_pnl_pct > 0.0);
+        self.net_sum += net_pnl_pct;
+        self.sleeve *= 1.0 + net_pnl_pct / 100.0;
+    }
+
+    fn win_rate(&self) -> f64 {
+        self.wins as f64 / self.trade_count.max(1) as f64
+    }
+
+    fn net_pnl_pct(&self) -> f64 {
+        (self.sleeve - 1.0) * 100.0
+    }
+
+    fn mean_pnl_pct(&self) -> f64 {
+        self.net_sum / self.trade_count.max(1) as f64
+    }
+}
+
+/// Every count lands in three places: its rule, its market, and the study total. Markets
+/// outside the universe have no tally, so their signals still reach the rule and the total.
+fn bump(
+    key: &str,
+    market: &str,
+    per_rule: &mut BTreeMap<String, Tally>,
+    per_market: &mut BTreeMap<String, Tally>,
+    total: &mut Tally,
+    apply: impl Fn(&mut Tally),
+) {
+    apply(per_rule.get_mut(key).expect("rule tally is inserted first"));
+    if let Some(tally) = per_market.get_mut(market) {
+        apply(tally);
+    }
+    apply(total);
+}
+
+/// Signals are replayed in a total order so the simulation is reproducible whatever
+/// order detection produced them in.
+fn signal_cmp(a: &Signal, b: &Signal) -> Ordering {
+    a.meta
+        .exchange_ts
+        .cmp(&b.meta.exchange_ts)
+        .then_with(|| a.meta.market.cmp(&b.meta.market))
+        .then_with(|| a.signal_type.cmp(&b.signal_type))
+        .then_with(|| a.rule_id.cmp(&b.rule_id))
+}
+
+/// Replay the qualified rules over the validation window as one equally weighted account.
+///
+/// Capital is split evenly across every market with a trade in the window; each sleeve
+/// compounds independently and holds at most one position at a time.  The result is a
+/// return an actual account could have produced, which is what makes the hold benchmark
+/// on the same universe a comparison rather than two unrelated numbers.
 pub fn paper(
     signals: &[Signal],
     trades: &[Trade],
     passed: &[String],
+    window: (NaiveDate, NaiveDate),
+    generated_at: DateTime<Utc>,
     cfg: &Config,
-) -> Vec<crate::model::PaperTrade> {
+) -> PaperReport {
+    let (window_start, window_end) = window;
     let index = TradeIndex::new(trades);
-    signals
+    let qualified: std::collections::HashSet<&String> = passed.iter().collect();
+    let round_trip_pct = 2.0 * (cfg.paper.fee_bps + cfg.paper.slippage_bps) / 100.0;
+
+    // The universe is every market that traded inside the window.  The strategy and the
+    // hold benchmark are weighted over this same set, so their difference means something.
+    let universe = index.window_universe(window_start, window_end);
+    let market_count = universe.len();
+    let mut per_market: BTreeMap<String, Tally> = universe
         .iter()
-        .filter(|s| passed.contains(&format!("{}:{}", s.signal_type, s.rule_id)))
-        .filter_map(|s| {
-            let e = index.at_or_after(&s.meta.market, s.meta.exchange_ts)?;
-            if e.meta.exchange_ts
-                > s.meta.exchange_ts + Duration::seconds(cfg.validation.entry_max_lag_seconds)
-            {
-                return None;
-            }
-            let x =
-                index.at_or_after(&s.meta.market, s.meta.exchange_ts + Duration::minutes(15))?;
-            let g = match s.direction {
-                Side::Buy => (x.price / e.price - 1.0) * 100.0,
-                Side::Sell => (e.price / x.price - 1.0) * 100.0,
-            };
-            Some(crate::model::PaperTrade {
-                signal: s.clone(),
-                entry_price: e.price,
-                exit_price: x.price,
-                gross_pnl_pct: g,
-                net_pnl_pct: g - 2.0 * (cfg.paper.fee_bps + cfg.paper.slippage_bps) / 100.0,
-                long_only_benchmark_pnl_pct: (x.price / e.price - 1.0) * 100.0,
-            })
+        .map(|(market, ..)| ((*market).to_owned(), Tally::new()))
+        .collect();
+    let mut per_rule: BTreeMap<String, Tally> = BTreeMap::new();
+    let mut total = Tally::new();
+
+    let mut ordered: Vec<&Signal> = signals
+        .iter()
+        .filter(|signal| qualified.contains(&rule_key(signal)))
+        .filter(|signal| {
+            let date = signal.meta.exchange_ts.date_naive();
+            date >= window_start && date <= window_end
         })
-        .collect()
+        .collect();
+    ordered.sort_by(|a, b| signal_cmp(a, b));
+
+    let mut busy_until: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let mut closes: Vec<(DateTime<Utc>, String, f64)> = Vec::new();
+    let mut paper_trades = Vec::new();
+
+    for signal in ordered {
+        let market = signal.meta.market.clone();
+        let key = rule_key(signal);
+        per_rule.entry(key.clone()).or_insert_with(Tally::new);
+        let at = signal.meta.exchange_ts;
+
+        if busy_until.get(&market).is_some_and(|until| at < *until) {
+            bump(
+                &key,
+                &market,
+                &mut per_rule,
+                &mut per_market,
+                &mut total,
+                |tally| tally.skipped_overlapping += 1,
+            );
+            continue;
+        }
+
+        // A market outside the universe has neither a sleeve to trade nor a hold benchmark
+        // to be judged against, so its signals are reported rather than silently dropped.
+        let filled = per_market
+            .contains_key(&market)
+            .then(|| {
+                let entry = index.at_or_after(&market, at).filter(|trade| {
+                    trade.meta.exchange_ts
+                        <= at + Duration::seconds(cfg.validation.entry_max_lag_seconds)
+                })?;
+                let exit = index.at_or_after(
+                    &market,
+                    at + Duration::minutes(cfg.validation.horizon_minutes),
+                )?;
+                Some((entry, exit))
+            })
+            .flatten();
+
+        let Some((entry, exit)) = filled else {
+            bump(
+                &key,
+                &market,
+                &mut per_rule,
+                &mut per_market,
+                &mut total,
+                |tally| tally.incomplete_horizon += 1,
+            );
+            continue;
+        };
+
+        let gross = match signal.direction {
+            Side::Buy => (exit.price / entry.price - 1.0) * 100.0,
+            Side::Sell => (entry.price / exit.price - 1.0) * 100.0,
+        };
+        let net = gross - round_trip_pct;
+        bump(
+            &key,
+            &market,
+            &mut per_rule,
+            &mut per_market,
+            &mut total,
+            |tally| tally.fill(net),
+        );
+        busy_until.insert(market.clone(), exit.meta.exchange_ts);
+        closes.push((
+            exit.meta.exchange_ts,
+            market.clone(),
+            per_market[&market].sleeve,
+        ));
+        paper_trades.push(crate::model::PaperTrade {
+            signal: signal.clone(),
+            entry_price: entry.price,
+            exit_price: exit.price,
+            gross_pnl_pct: gross,
+            net_pnl_pct: net,
+        });
+    }
+
+    let markets: Vec<PaperMarketRow> = universe
+        .iter()
+        .map(|(market, first, last)| {
+            let tally = &per_market[*market];
+            PaperMarketRow {
+                market: (*market).to_owned(),
+                trade_count: tally.trade_count,
+                skipped_overlapping: tally.skipped_overlapping,
+                incomplete_horizon: tally.incomplete_horizon,
+                win_rate: tally.win_rate(),
+                net_pnl_pct: tally.net_pnl_pct(),
+                mean_pnl_pct: tally.mean_pnl_pct(),
+                hodl_pnl_pct: (last / first - 1.0) * 100.0 - round_trip_pct,
+            }
+        })
+        .collect();
+    let rules: Vec<PaperRuleRow> = per_rule
+        .iter()
+        .map(|(rule_key, tally)| PaperRuleRow {
+            rule_key: rule_key.clone(),
+            trade_count: tally.trade_count,
+            skipped_overlapping: tally.skipped_overlapping,
+            incomplete_horizon: tally.incomplete_horizon,
+            win_rate: tally.win_rate(),
+            net_pnl_pct: tally.net_pnl_pct(),
+            mean_pnl_pct: tally.mean_pnl_pct(),
+        })
+        .collect();
+    // An empty universe sums to zero over a denominator of one, which is the honest answer:
+    // nothing was traded and nothing was held.
+    let equal_weight = |value: fn(&PaperMarketRow) -> f64| {
+        markets.iter().map(value).sum::<f64>() / market_count.max(1) as f64
+    };
+    let cumulative_net_pnl_pct = equal_weight(|row| row.net_pnl_pct);
+    let hodl_pnl_pct = equal_weight(|row| row.hodl_pnl_pct);
+
+    PaperReport {
+        summary: crate::model::PaperSummary {
+            generated_at,
+            trade_count: total.trade_count,
+            cumulative_net_pnl_pct,
+            win_rate: total.win_rate(),
+            window_start: Some(window_start),
+            window_end: Some(window_end),
+            market_count,
+            skipped_overlapping: total.skipped_overlapping,
+            incomplete_horizon: total.incomplete_horizon,
+            max_drawdown_pct: max_drawdown_pct(&closes, &universe),
+            hodl_pnl_pct,
+            excess_pnl_pct: cumulative_net_pnl_pct - hodl_pnl_pct,
+        },
+        trades: paper_trades,
+        rules,
+        markets,
+        window,
+        horizon_minutes: cfg.validation.horizon_minutes,
+        fee_bps: cfg.paper.fee_bps,
+        slippage_bps: cfg.paper.slippage_bps,
+    }
+}
+
+/// Deepest peak-to-trough move of the equally weighted equity curve, in percent and
+/// negative.  The curve is marked at position closes only: open positions are not
+/// marked to market, so this is a floor on the real drawdown, never an overstatement.
+fn max_drawdown_pct(closes: &[(DateTime<Utc>, String, f64)], universe: &[(&str, f64, f64)]) -> f64 {
+    if universe.is_empty() {
+        return 0.0;
+    }
+    let mut sleeves: BTreeMap<&str, f64> = universe.iter().map(|(m, ..)| (*m, 1.0)).collect();
+    let mut ordered: Vec<&(DateTime<Utc>, String, f64)> = closes.iter().collect();
+    ordered.sort_by_key(|(at, ..)| *at);
+    let mut peak = 1.0_f64;
+    let mut worst = 0.0_f64;
+    for (_, market, sleeve) in ordered {
+        if let Some(slot) = sleeves.get_mut(market.as_str()) {
+            *slot = *sleeve;
+        }
+        let value = sleeves.values().sum::<f64>() / universe.len() as f64;
+        peak = peak.max(value);
+        worst = worst.min((value - peak) / peak * 100.0);
+    }
+    worst
+}
+
+/// The universe refreshes daily to the top markets by volume, so a market that fell out
+/// is absent from later dates.  That biases the hold benchmark upward, which makes the
+/// verdict conservative in the strategy's favour — and belongs in the report, not a footnote
+/// in a document nobody opens.
+const SURVIVORSHIP_CAVEAT: &str = "The market universe refreshes daily to the top markets by volume, so markets that fell\nout of it are absent from later dates. That survivorship bias favours hold: beating this\nbenchmark is a stronger result than the raw gap suggests, and losing to it a weaker one.";
+
+/// The milestone's single number, stated so the reader does not have to do the subtraction.
+fn paper_verdict(report: &PaperReport) -> String {
+    let (start, end) = report.window;
+    let excess = report.summary.excess_pnl_pct;
+    match excess.partial_cmp(&0.0) {
+        Some(Ordering::Greater) => {
+            format!("VERDICT: STRATEGY WINS by {excess:.3}pp over {start}–{end}")
+        }
+        Some(Ordering::Less) => {
+            format!("VERDICT: HOLD WINS by {:.3}pp over {start}–{end}", -excess)
+        }
+        _ => format!("VERDICT: TIE at 0.000pp over {start}–{end}"),
+    }
+}
+
+/// Trade-weighted mean across rules, which is total net divided by total trades without
+/// carrying a second copy of either.
+fn mean_across_rules(report: &PaperReport) -> f64 {
+    let trades: usize = report.rules.iter().map(|rule| rule.trade_count).sum();
+    let total: f64 = report
+        .rules
+        .iter()
+        .map(|rule| rule.mean_pnl_pct * rule.trade_count as f64)
+        .sum();
+    total / trades.max(1) as f64
+}
+
+pub fn render_paper_markdown(report: &PaperReport) -> Result<String> {
+    let summary = &report.summary;
+    let (start, end) = report.window;
+    let markets = format!(
+        "{} market{}",
+        summary.market_count,
+        if summary.market_count == 1 { "" } else { "s" }
+    );
+    let mut output = String::from("# Rustle paper study\n\n");
+    writeln!(
+        output,
+        "Window: {}–{} (validation only) · {} · horizon {}m · fees {}bps, slippage {}bps\n",
+        start, end, markets, report.horizon_minutes, report.fee_bps, report.slippage_bps,
+    )
+    .expect("writing to String cannot fail");
+
+    output.push_str("| Rule | Trades | Skipped (overlap) | Incomplete | Win rate | Net P&L | Mean / trade |\n|---|---:|---:|---:|---:|---:|---:|\n");
+    for rule in &report.rules {
+        writeln!(
+            output,
+            "| {} | {} | {} | {} | {:.1}% | {:+.3}% | {:+.3}% |",
+            rule.rule_key,
+            rule.trade_count,
+            rule.skipped_overlapping,
+            rule.incomplete_horizon,
+            rule.win_rate * 100.0,
+            rule.net_pnl_pct,
+            rule.mean_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+
+    output.push_str("\n| Market | Trades | Net P&L | Hold P&L |\n|---|---:|---:|---:|\n");
+    for market in &report.markets {
+        writeln!(
+            output,
+            "| {} | {} | {:+.3}% | {:+.3}% |",
+            market.market, market.trade_count, market.net_pnl_pct, market.hodl_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+
+    if summary.trade_count == 0 {
+        output.push_str("\nNo qualified signal produced a paper trade in this window.\n");
+    }
+    writeln!(
+        output,
+        "\nStrategy: {:+.3}% net, max drawdown {:.3}%, {} trades, {} skipped for overlap, {} incomplete.",
+        summary.cumulative_net_pnl_pct,
+        summary.max_drawdown_pct,
+        summary.trade_count,
+        summary.skipped_overlapping,
+        summary.incomplete_horizon,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "Hold:     {:+.3}% (equal weight over the same {}, one round trip).\n",
+        summary.hodl_pnl_pct, markets,
+    )
+    .expect("writing to String cannot fail");
+    output.push_str(SURVIVORSHIP_CAVEAT);
+    writeln!(output, "\n\n{}", paper_verdict(report)).expect("writing to String cannot fail");
+    Ok(output)
+}
+
+pub fn render_paper_csv(report: &PaperReport) -> String {
+    let summary = &report.summary;
+    let mut output = String::from(
+        "section,key,trades,skipped_overlapping,incomplete_horizon,win_rate,net_pnl_pct,mean_pnl_pct,max_drawdown_pct,hodl_pnl_pct\n",
+    );
+    for rule in &report.rules {
+        // A rule has no hold benchmark: you cannot hold a rule, only the markets it traded.
+        writeln!(
+            output,
+            "rule,{},{},{},{},{:.4},{:.4},{:.4},,",
+            rule.rule_key,
+            rule.trade_count,
+            rule.skipped_overlapping,
+            rule.incomplete_horizon,
+            rule.win_rate,
+            rule.net_pnl_pct,
+            rule.mean_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+    for market in &report.markets {
+        writeln!(
+            output,
+            "market,{},{},{},{},{:.4},{:.4},{:.4},,{:.4}",
+            market.market,
+            market.trade_count,
+            market.skipped_overlapping,
+            market.incomplete_horizon,
+            market.win_rate,
+            market.net_pnl_pct,
+            market.mean_pnl_pct,
+            market.hodl_pnl_pct,
+        )
+        .expect("writing to String cannot fail");
+    }
+    writeln!(
+        output,
+        "total,ALL,{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
+        summary.trade_count,
+        summary.skipped_overlapping,
+        summary.incomplete_horizon,
+        summary.win_rate,
+        summary.cumulative_net_pnl_pct,
+        mean_across_rules(report),
+        summary.max_drawdown_pct,
+        summary.hodl_pnl_pct,
+    )
+    .expect("writing to String cannot fail");
+    // The verdict is the deliverable, so it trails the rows here exactly as it ends the
+    // Markdown report. Consumers already have to read the `section` column.
+    writeln!(output, "{}", paper_verdict(report)).expect("writing to String cannot fail");
+    output
+}
+
+#[cfg(test)]
+mod milestone_four_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn paper_fixture() -> PaperReport {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 1, 28).unwrap();
+        PaperReport {
+            summary: crate::model::PaperSummary {
+                generated_at: Utc.with_ymd_and_hms(2025, 1, 29, 0, 0, 0).unwrap(),
+                trade_count: 3,
+                cumulative_net_pnl_pct: 0.75,
+                win_rate: 2.0 / 3.0,
+                window_start: Some(start),
+                window_end: Some(end),
+                market_count: 2,
+                skipped_overlapping: 1,
+                incomplete_horizon: 2,
+                max_drawdown_pct: -1.2,
+                hodl_pnl_pct: 2.0,
+                excess_pnl_pct: -1.25,
+            },
+            trades: vec![],
+            rules: vec![PaperRuleRow {
+                rule_key: "synthetic:a".into(),
+                trade_count: 3,
+                skipped_overlapping: 1,
+                incomplete_horizon: 2,
+                win_rate: 2.0 / 3.0,
+                net_pnl_pct: 1.5,
+                mean_pnl_pct: 0.5,
+            }],
+            markets: vec![
+                PaperMarketRow {
+                    market: "KRW-A".into(),
+                    trade_count: 2,
+                    skipped_overlapping: 0,
+                    incomplete_horizon: 1,
+                    win_rate: 1.0,
+                    net_pnl_pct: 1.0,
+                    mean_pnl_pct: 0.5,
+                    hodl_pnl_pct: 3.0,
+                },
+                PaperMarketRow {
+                    market: "KRW-B".into(),
+                    trade_count: 1,
+                    skipped_overlapping: 1,
+                    incomplete_horizon: 1,
+                    win_rate: 0.0,
+                    net_pnl_pct: 0.5,
+                    mean_pnl_pct: 0.5,
+                    hodl_pnl_pct: 1.0,
+                },
+            ],
+            window: (start, end),
+            horizon_minutes: 15,
+            fee_bps: 5.0,
+            slippage_bps: 3.0,
+        }
+    }
+
+    #[test]
+    fn paper_report_renders_both_tables_and_ends_in_an_explicit_verdict() {
+        let report = paper_fixture();
+
+        let markdown = render_paper_markdown(&report).unwrap();
+        assert!(markdown.contains(
+            "Window: 2025-01-15–2025-01-28 (validation only) · 2 markets · horizon 15m · fees 5bps, slippage 3bps"
+        ));
+        assert!(markdown.contains("| synthetic:a | 3 | 1 | 2 | 66.7% | +1.500% | +0.500% |"));
+        assert!(markdown.contains("| KRW-A | 2 | +1.000% | +3.000% |"));
+        assert!(markdown.contains(
+            "Strategy: +0.750% net, max drawdown -1.200%, 3 trades, 1 skipped for overlap, 2 incomplete."
+        ));
+        assert!(markdown.contains("Hold:     +2.000%"));
+        assert!(
+            markdown.contains("survivorship"),
+            "the hold benchmark's bias belongs in the report, not only in the ADR"
+        );
+        assert_eq!(
+            markdown.lines().last(),
+            Some("VERDICT: HOLD WINS by 1.250pp over 2025-01-15–2025-01-28")
+        );
+
+        let csv = render_paper_csv(&report);
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some("section,key,trades,skipped_overlapping,incomplete_horizon,win_rate,net_pnl_pct,mean_pnl_pct,max_drawdown_pct,hodl_pnl_pct")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("rule,synthetic:a,3,1,2,0.6667,1.5000,0.5000,,")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("market,KRW-A,2,0,1,1.0000,1.0000,0.5000,,3.0000")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("market,KRW-B,1,1,1,0.0000,0.5000,0.5000,,1.0000")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("total,ALL,3,1,2,0.6667,0.7500,0.5000,-1.2000,2.0000")
+        );
+        assert_eq!(
+            csv.lines().last(),
+            Some("VERDICT: HOLD WINS by 1.250pp over 2025-01-15–2025-01-28")
+        );
+    }
+
+    #[test]
+    fn the_verdict_names_the_winner_in_both_directions_and_calls_a_tie_a_tie() {
+        let mut report = paper_fixture();
+        report.summary.cumulative_net_pnl_pct = 3.5;
+        report.summary.excess_pnl_pct = 1.5;
+
+        let winner = Some("VERDICT: STRATEGY WINS by 1.500pp over 2025-01-15–2025-01-28");
+        assert_eq!(
+            render_paper_markdown(&report).unwrap().lines().last(),
+            winner
+        );
+        assert_eq!(render_paper_csv(&report).lines().last(), winner);
+
+        report.summary.excess_pnl_pct = 0.0;
+        assert_eq!(
+            render_paper_markdown(&report).unwrap().lines().last(),
+            Some("VERDICT: TIE at 0.000pp over 2025-01-15–2025-01-28")
+        );
+    }
+
+    #[test]
+    fn a_paper_study_with_no_trades_renders_its_tables_and_says_so() {
+        let mut report = paper_fixture();
+        report.summary.trade_count = 0;
+        report.summary.win_rate = 0.0;
+        report.summary.cumulative_net_pnl_pct = 0.0;
+        report.summary.max_drawdown_pct = 0.0;
+        report.summary.excess_pnl_pct = -report.summary.hodl_pnl_pct;
+        report.rules.clear();
+        for market in &mut report.markets {
+            market.trade_count = 0;
+            market.win_rate = 0.0;
+            market.net_pnl_pct = 0.0;
+            market.mean_pnl_pct = 0.0;
+        }
+
+        let markdown = render_paper_markdown(&report).unwrap();
+        assert!(markdown.contains("| Rule | Trades |"));
+        assert!(markdown.contains("| Market | Trades |"));
+        assert!(markdown.contains("No qualified signal produced a paper trade in this window."));
+        assert!(!markdown.contains("NaN"), "{markdown}");
+        assert_eq!(
+            markdown.lines().last(),
+            Some("VERDICT: HOLD WINS by 2.000pp over 2025-01-15–2025-01-28")
+        );
+
+        let csv = render_paper_csv(&report);
+        assert!(!csv.contains("NaN"), "{csv}");
+        assert_eq!(
+            csv.lines().filter(|line| line.starts_with("rule,")).count(),
+            0
+        );
+        assert_eq!(
+            csv.lines().last(),
+            Some("VERDICT: HOLD WINS by 2.000pp over 2025-01-15–2025-01-28")
+        );
+    }
 }
 
 #[cfg(test)]
