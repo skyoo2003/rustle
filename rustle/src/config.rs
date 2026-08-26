@@ -14,6 +14,9 @@ pub struct Config {
     pub stall_timeout_seconds: i64,
     #[serde(default = "default_flush_interval_seconds")]
     pub flush_interval_seconds: i64,
+    /// zstd level for written Parquet, 1..=22.
+    #[serde(default = "default_compression_level")]
+    pub compression_level: i32,
     pub imbalance_window_seconds: i64,
     pub trade_rate_window_seconds: i64,
     pub wall_min_krw: f64,
@@ -28,6 +31,9 @@ fn default_stall_timeout_seconds() -> i64 {
 }
 fn default_flush_interval_seconds() -> i64 {
     30
+}
+fn default_compression_level() -> i32 {
+    3
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateConfig {
@@ -100,6 +106,7 @@ impl Default for Config {
             daily_refresh_utc_hour: 0,
             stall_timeout_seconds: default_stall_timeout_seconds(),
             flush_interval_seconds: default_flush_interval_seconds(),
+            compression_level: default_compression_level(),
             imbalance_window_seconds: 60,
             trade_rate_window_seconds: 60,
             wall_min_krw: 10_000_000.0,
@@ -165,6 +172,7 @@ mod tests {
         let table = value.as_table_mut().unwrap();
         table.remove("stall_timeout_seconds");
         table.remove("flush_interval_seconds");
+        table.remove("compression_level");
         table.remove("alert");
         table
             .get_mut("validation")
@@ -176,9 +184,50 @@ mod tests {
         let loaded: Config = value.try_into().unwrap();
 
         assert_eq!(loaded.stall_timeout_seconds, 90);
-        assert_eq!(loaded.flush_interval_seconds, 30);
+        assert_eq!(loaded.flush_interval_seconds, 300);
+        assert_eq!(loaded.compression_level, 3);
         assert_eq!(loaded.alert.cooldown_seconds, 900);
         assert!(loaded.validation.family_wise_correction);
+    }
+
+    #[test]
+    fn flush_interval_defaults_to_five_minutes() {
+        // At the measured 65 orderbooks/s across 20 markets, a 30s cadence with a
+        // 100-record trigger wrote ~15.6 files/s — 37.7M files over the 28-day gate window.
+        // File count must track flush cadence, not record volume.
+        assert_eq!(Config::default().flush_interval_seconds, 300);
+    }
+
+    #[test]
+    fn compression_level_defaults_into_zstds_accepted_range() {
+        let cfg = Config::default();
+        assert_eq!(cfg.compression_level, 3);
+        cfg.validate_collection_intervals().unwrap();
+    }
+
+    #[test]
+    fn compression_level_outside_zstd_range_is_rejected_before_collection_starts() {
+        for bad in [0, 23, -1] {
+            let cfg = Config {
+                compression_level: bad,
+                ..Config::default()
+            };
+            assert!(
+                cfg.validate_collection_intervals()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("compression_level"),
+                "level {bad} must be rejected"
+            );
+        }
+        for ok in [1, 22] {
+            Config {
+                compression_level: ok,
+                ..Config::default()
+            }
+            .validate_collection_intervals()
+            .unwrap();
+        }
     }
 
     #[test]

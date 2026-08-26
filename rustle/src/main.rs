@@ -290,6 +290,10 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
     }
 }
 
+/// Memory backstop only. Normal flushing is the `flush_interval_seconds` ticker; this
+/// exists so a starved ticker cannot grow a buffer without bound.
+const MAX_BUFFERED_RECORDS: usize = 50_000;
+
 #[derive(Debug, PartialEq, Eq)]
 enum Maintenance {
     Flush,
@@ -1110,6 +1114,45 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].state, "stalled");
         assert_eq!(events[0].detail, "no frame within stall timeout");
+    }
+
+    #[test]
+    fn buffer_backstop_sits_far_above_one_flush_interval_of_observed_traffic() {
+        // Measured 2026-08-26: 7,516 orderbooks in 116s across 20 markets = ~65/s.
+        // The backstop exists to bound memory if the flush ticker is starved, not to
+        // drive normal flushing — if it trips on ordinary traffic we are back to
+        // writing a file per market every few seconds.
+        let per_interval = 65 * Config::default().flush_interval_seconds as usize;
+        assert!(
+            MAX_BUFFERED_RECORDS > per_interval * 2,
+            "backstop {MAX_BUFFERED_RECORDS} must clear {per_interval} buffered records with margin"
+        );
+    }
+
+    #[test]
+    fn one_flush_writes_one_file_per_market_day_regardless_of_record_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trades: Vec<Trade> = (0..600)
+            .map(|i| {
+                let mut m = meta(0);
+                m.market = if i % 2 == 0 { "KRW-A" } else { "KRW-B" }.into();
+                Trade {
+                    meta: m,
+                    price: 10.,
+                    volume: 1.,
+                    side: Side::Buy,
+                    sequential_id: None,
+                }
+            })
+            .collect();
+
+        flush(dir.path(), &mut trades, &mut vec![], &mut vec![]).unwrap();
+
+        let files = std::fs::read_dir(dir.path().join("trades/date=2025-01-01"))
+            .unwrap()
+            .flat_map(|market| std::fs::read_dir(market.unwrap().path()).unwrap())
+            .count();
+        assert_eq!(files, 2, "600 records across 2 markets is 2 files, not 12");
     }
 
     #[test]
