@@ -1093,8 +1093,10 @@ pub fn paper(
             {
                 return None;
             }
-            let x =
-                index.at_or_after(&s.meta.market, s.meta.exchange_ts + Duration::minutes(15))?;
+            let x = index.at_or_after(
+                &s.meta.market,
+                s.meta.exchange_ts + Duration::minutes(cfg.validation.horizon_minutes),
+            )?;
             let g = match s.direction {
                 Side::Buy => (x.price / e.price - 1.0) * 100.0,
                 Side::Sell => (e.price / x.price - 1.0) * 100.0,
