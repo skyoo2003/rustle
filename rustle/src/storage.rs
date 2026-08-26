@@ -142,6 +142,26 @@ pub fn read_date<T: DeserializeOwned>(
     read_parquet_files(files)
 }
 
+/// Total bytes and Parquet file count beneath `root`. Feeds the coverage projection, which
+/// is how a collection that will not fit is noticed on day one rather than day 28.
+pub fn footprint(root: &Path) -> Result<(u64, usize)> {
+    if !root.exists() {
+        return Ok((0, 0));
+    }
+    let mut files = vec![];
+    walk(root, &mut files)?;
+    let parquet = files
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"));
+    let mut bytes = 0;
+    let mut count = 0;
+    for path in parquet {
+        bytes += fs::metadata(&path)?.len();
+        count += 1;
+    }
+    Ok((bytes, count))
+}
+
 /// Replace a derived dataset. Raw collection datasets are never replaced by this helper.
 pub fn clear_dataset(root: &Path, dataset: &str) -> Result<()> {
     let path = root.join(dataset);

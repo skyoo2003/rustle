@@ -90,15 +90,16 @@ fn footprint_counts_every_parquet_file_and_its_bytes() {
 }
 
 #[test]
-fn the_projection_extrapolates_the_collected_dates_to_the_full_gate_window() {
+fn the_projection_extrapolates_observed_collection_time_to_the_full_gate_window() {
     // The instrument that would have caught a 542 GB collection on day one instead of day 28.
-    let projected = analysis::render_footprint_projection(2_000_000_000, 40_000, 2, 28);
+    // Two complete UTC dates = 172,800 seconds; 2 GB and 40k files over that extrapolates
+    // to 28 GB and 560k files across the 28-date window.
+    let projected = analysis::render_footprint_projection(2_000_000_000, 40_000, 172_800, 28);
 
     assert!(
         projected.contains("28"),
         "must name the required window: {projected}"
     );
-    // 2 GB and 40k files over 2 dates extrapolates to 28 GB and 560k files.
     assert!(
         projected.contains("28.0 GB"),
         "must project total bytes: {projected}"
@@ -111,7 +112,24 @@ fn the_projection_extrapolates_the_collected_dates_to_the_full_gate_window() {
     let nothing_yet = analysis::render_footprint_projection(0, 0, 0, 28);
     assert!(
         !nothing_yet.contains("NaN") && !nothing_yet.contains("inf"),
-        "zero collected dates must not divide by zero: {nothing_yet}"
+        "zero observed seconds must not divide by zero: {nothing_yet}"
+    );
+}
+
+#[test]
+fn a_partial_date_projects_by_elapsed_time_not_as_a_complete_date() {
+    // The real 2026-08-26 partition held 26 MB and 1,810 files across 116 SECONDS.
+    // Scaling by "1 of 28 dates" reports 0.7 GB and hides the problem completely;
+    // scaling by elapsed collection time reports the ~542 GB that is actually coming.
+    let projected = analysis::render_footprint_projection(26_000_000, 1_810, 116, 28);
+
+    assert!(
+        projected.contains("542") && projected.contains("GB"),
+        "116s of 26 MB must project ~542 GB, got: {projected}"
+    );
+    assert!(
+        projected.contains("37,7"),
+        "must project ~37.7M files, got: {projected}"
     );
 }
 

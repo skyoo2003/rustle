@@ -705,9 +705,23 @@ fn coverage(cfg: &Config, csv: bool) -> Result<()> {
         }
         println!();
     }
+    let (bytes, file_count) = storage::footprint(&root)?;
+    // Elapsed exchange time actually covered, not the number of dates touched: a date
+    // holding 90 seconds of data is still a present date.
+    let stamps = trades
+        .iter()
+        .map(|t| t.meta.exchange_ts)
+        .chain(books.iter().map(|b| b.meta.exchange_ts));
+    let observed_seconds = match (stamps.clone().min(), stamps.max()) {
+        (Some(first), Some(last)) => (last - first).num_seconds(),
+        _ => 0,
+    };
     let summary = format!(
-        "{} of {} required contiguous UTC dates present",
-        status.present_count, status.required
+        "{} of {} required contiguous UTC dates present\n{}",
+        status.present_count,
+        status.required,
+        analysis::render_footprint_projection(bytes, file_count, observed_seconds, status.required)
+            .trim_end(),
     );
     if csv {
         eprintln!("{summary}");
