@@ -723,16 +723,7 @@ fn coverage(cfg: &Config, csv: bool) -> Result<()> {
         println!();
     }
     let (bytes, file_count) = storage::footprint(&root)?;
-    // Elapsed exchange time actually covered, not the number of dates touched: a date
-    // holding 90 seconds of data is still a present date.
-    let stamps = trades
-        .iter()
-        .map(|t| t.meta.exchange_ts)
-        .chain(books.iter().map(|b| b.meta.exchange_ts));
-    let observed_seconds = match (stamps.clone().min(), stamps.max()) {
-        (Some(first), Some(last)) => (last - first).num_seconds(),
-        _ => 0,
-    };
+    let observed_seconds = analysis::observed_collection_seconds(&trades, &books);
     let summary = format!(
         "{} of {} required contiguous UTC dates present\n{}",
         status.present_count,

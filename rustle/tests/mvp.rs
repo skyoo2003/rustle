@@ -117,6 +117,27 @@ fn the_projection_extrapolates_observed_collection_time_to_the_full_gate_window(
 }
 
 #[test]
+fn observed_time_counts_seconds_that_hold_data_and_skips_the_gaps() {
+    // Two short sittings a day apart is ~3 minutes of collection, not 22.7 hours.
+    // Measuring first-to-last span counts the idle gap as collection and understates
+    // the projected footprint by orders of magnitude -- and a real 28-day run has gaps.
+    let day = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+    let next = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+    let trades = vec![
+        trade_on(day, 0, "KRW-A", 10.0),
+        trade_on(day, 0, "KRW-A", 11.0),
+        trade_on(next, 22, "KRW-A", 12.0),
+    ];
+    let books = vec![book_on(day, 0, "KRW-A", 900.0, 100.0)];
+
+    let observed = analysis::observed_collection_seconds(&trades, &books);
+
+    // Three records share one second on day one, one record on the next day: 2 seconds held
+    // data. The ~46h between them is idle and must not count.
+    assert_eq!(observed, 2);
+}
+
+#[test]
 fn a_partial_date_projects_by_elapsed_time_not_as_a_complete_date() {
     // The real 2026-08-26 partition held 26 MB and 1,810 files across 116 SECONDS.
     // Scaling by "1 of 28 dates" reports 0.7 GB and hides the problem completely;

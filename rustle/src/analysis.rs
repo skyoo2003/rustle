@@ -150,6 +150,21 @@ pub fn collection_date_status(
     })
 }
 
+/// Seconds that actually hold data, counted as distinct one-second buckets.
+///
+/// Not first-to-last span: two short sittings a day apart are three minutes of collection,
+/// not twenty-two hours, and a 28-day run accumulates gaps from disconnects and restarts.
+/// Counting buckets ignores idle time, and where a market is quiet it undercounts — which
+/// pushes the projection up rather than down, the safe direction for "do I have room".
+pub fn observed_collection_seconds(trades: &[Trade], books: &[Orderbook]) -> i64 {
+    let seconds: BTreeSet<i64> = trades
+        .iter()
+        .map(|t| t.meta.exchange_ts.timestamp())
+        .chain(books.iter().map(|b| b.meta.exchange_ts.timestamp()))
+        .collect();
+    seconds.len() as i64
+}
+
 /// What the collected dates so far imply for the full gate window.
 ///
 /// The 2026-08-26 sample was 26 MB and 1,810 files for 116 seconds of one date. Nothing in
