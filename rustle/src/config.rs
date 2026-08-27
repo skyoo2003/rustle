@@ -26,8 +26,11 @@ pub struct Config {
 fn default_stall_timeout_seconds() -> i64 {
     90
 }
+/// Normal flushing cadence. File count tracks this, not record volume: at the measured
+/// 65 orderbooks/s across 20 markets a 30s cadence plus a 100-record trigger wrote
+/// ~15.6 files/s, which is 37.7M files over the 28-day gate window.
 fn default_flush_interval_seconds() -> i64 {
-    30
+    300
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateConfig {
@@ -176,9 +179,17 @@ mod tests {
         let loaded: Config = value.try_into().unwrap();
 
         assert_eq!(loaded.stall_timeout_seconds, 90);
-        assert_eq!(loaded.flush_interval_seconds, 30);
+        assert_eq!(loaded.flush_interval_seconds, 300);
         assert_eq!(loaded.alert.cooldown_seconds, 900);
         assert!(loaded.validation.family_wise_correction);
+    }
+
+    #[test]
+    fn flush_interval_defaults_to_five_minutes() {
+        // At the measured 65 orderbooks/s across 20 markets, a 30s cadence with a
+        // 100-record trigger wrote ~15.6 files/s — 37.7M files over the 28-day gate window.
+        // File count must track flush cadence, not record volume.
+        assert_eq!(Config::default().flush_interval_seconds, 300);
     }
 
     #[test]

@@ -57,13 +57,38 @@ cargo run -p rustle -- paper   --config rustle.toml
 Requires a recent stable Rust toolchain (edition 2021).
 
 Collection flushes buffered trades, orderbooks, and live signals every
-`flush_interval_seconds` (30 seconds by default), in addition to size-based flushes. If no
-WebSocket frame arrives within `stall_timeout_seconds` (90 seconds by default), Rustle flushes the
-buffers, records a `stalled` connection event, and reconnects automatically. Both values must be
-positive. Run `collect --config rustle.toml` continuously in a terminal or your existing process
-manager; this repository intentionally does not install a background service. Run `coverage`
-periodically (or `coverage --csv`) to inspect daily counts, markets, disconnects, stalls, connection
-gaps, and progress toward the required 28 contiguous UTC dates.
+`flush_interval_seconds` (300 seconds by default). If no WebSocket frame arrives within
+`stall_timeout_seconds` (90 seconds by default), Rustle flushes the buffers, records a `stalled`
+connection event, and reconnects automatically. Both values must be positive. Run
+`collect --config rustle.toml` continuously in a terminal or your existing process manager; this
+repository intentionally does not install a background service.
+
+**What the 28-day run costs.** One flush writes one Parquet file per market per dataset, so file
+count tracks the flush cadence and not how busy the market is: roughly 300 files per flush interval
+across a 20-market universe, or ~500K files over the full window. Parquet is written ZSTD-compressed,
+which is worth about 34x on this data — a JSON payload column with a repeated field-name skeleton.
+Budget tens of GB, not hundreds. Both numbers scale with `top_market_count`.
+
+There is a five-minute buffer in front of that. Ctrl-C (SIGINT), **SIGTERM**, a stall, a disconnect,
+and any write error all flush first, so the exposure is one `flush_interval_seconds` window only on
+a death that runs no code at all — SIGKILL, panic, power loss. SIGTERM matters because that is how
+`systemd`, `launchd`, Docker and `timeout` stop a service: a managed restart flushes rather than
+discarding the buffer. Lower `flush_interval_seconds` if you would rather trade files for
+durability; the cost is roughly linear.
+
+Run `coverage` periodically (or `coverage --csv`) to inspect daily counts, markets, disconnects,
+stalls, connection gaps, and progress toward the required 28 contiguous UTC dates. It ends with a
+projected footprint:
+
+```text
+1 of 28 required contiguous UTC dates present
+Footprint: 2.1 GB in 74,318 files over 18.4h of collection → 79.2 GB and 2,834,901 files projected for 28 dates.
+```
+
+That projection scales by **elapsed collection time**, not by how many dates have been touched — a
+date holding ninety seconds of data is still one present date, and scaling by dates would report a
+runaway trajectory as a rounding error. Check it on day one. If the projected figures do not fit the
+disk you have, stop and fix that before spending 28 days finding out.
 
 ## Data layout
 

@@ -150,6 +150,79 @@ pub fn collection_date_status(
     })
 }
 
+/// Seconds that actually hold data, counted as distinct one-second buckets.
+///
+/// Not first-to-last span: two short sittings a day apart are three minutes of collection,
+/// not twenty-two hours, and a 28-day run accumulates gaps from disconnects and restarts.
+/// Counting buckets ignores idle time, and where a market is quiet it undercounts — which
+/// pushes the projection up rather than down, the safe direction for "do I have room".
+pub fn observed_collection_seconds(trades: &[Trade], books: &[Orderbook]) -> i64 {
+    let seconds: BTreeSet<i64> = trades
+        .iter()
+        .map(|t| t.meta.exchange_ts.timestamp())
+        .chain(books.iter().map(|b| b.meta.exchange_ts.timestamp()))
+        .collect();
+    seconds.len() as i64
+}
+
+/// What the collected dates so far imply for the full gate window.
+///
+/// The 2026-08-26 sample was 26 MB and 1,810 files for 116 seconds of one date. Nothing in
+/// `coverage` said where that was heading, so it stayed invisible until someone multiplied
+/// it out by hand. This line does the multiplying.
+pub fn render_footprint_projection(
+    bytes: u64,
+    files: usize,
+    observed_seconds: i64,
+    required_dates: usize,
+) -> String {
+    if observed_seconds <= 0 {
+        return format!(
+            "Not enough collected data to project a footprint; \
+             {required_dates} complete UTC dates required before analyze can run.\n"
+        );
+    }
+    // Scale by elapsed collection time, never by date count. A date holding 90 seconds of
+    // data is still one present date, and scaling by dates would report a 542 GB trajectory
+    // as 0.7 GB — the precise blindness that let this go unnoticed until day 28.
+    let scale = (required_dates as f64 * 86_400.0) / observed_seconds as f64;
+    // Decimal GB, matching what `df -H` and the disk vendor report — this number exists to
+    // answer "do I have room", not to match `du -h`.
+    let gb = bytes as f64 * scale / 1_000_000_000.0;
+    let projected_files = (files as f64 * scale).round() as u64;
+    format!(
+        "Footprint: {:.1} GB in {} files over {} of collection \
+         → {:.1} GB and {} files projected for {} dates.\n",
+        bytes as f64 / 1_000_000_000.0,
+        thousands(files as u64),
+        humanize_seconds(observed_seconds),
+        gb,
+        thousands(projected_files),
+        required_dates,
+    )
+}
+
+fn humanize_seconds(seconds: i64) -> String {
+    match seconds {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7_200 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{:.1}h", s as f64 / 3_600.0),
+        s => format!("{:.1}d", s as f64 / 86_400.0),
+    }
+}
+
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoverageDay {
     pub date: NaiveDate,
@@ -409,6 +482,21 @@ struct SelectedCandidate<'a> {
     train_controls: Vec<bool>,
 }
 pub fn build_signals(trades: &[Trade], books: &[Orderbook], cfg: &Config) -> Vec<Signal> {
+    feed_signals(&mut SignalDetector::new(cfg), trades, books)
+}
+
+/// Drive one chunk of already-collected data through a detector the caller owns.
+///
+/// `analyze` reads the archive one UTC partition at a time, so the detector must outlive
+/// the chunk: rolling windows and the `active_rules` edge-tracking that decides whether a
+/// signal fires at all do not reset at midnight during live collection, and must not reset
+/// here either. Passing a fresh detector per chunk re-arms every active rule on every
+/// market at every boundary.
+pub fn feed_signals(
+    detector: &mut SignalDetector,
+    trades: &[Trade],
+    books: &[Orderbook],
+) -> Vec<Signal> {
     let mut trades: Vec<&Trade> = trades.iter().collect();
     let mut books: Vec<&Orderbook> = books.iter().collect();
     trades.sort_by(|a, b| trade_cmp(a, b));
@@ -425,7 +513,6 @@ pub fn build_signals(trades: &[Trade], books: &[Orderbook], cfg: &Config) -> Vec
         )
         .collect();
     events.sort_by_key(|event| (event.0, event.1, event.2));
-    let mut detector = SignalDetector::new(cfg);
     let mut out = vec![];
     for (_, is_trade, i) in events {
         if is_trade {

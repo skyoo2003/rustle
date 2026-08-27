@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+// Aliased: `Signal` is already the detector's output type in this file.
+use tokio::signal::unix::{signal, Signal as UnixSignal, SignalKind};
 
 #[derive(Parser)]
 #[command(
@@ -108,6 +110,8 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
     );
     let mut delay = 1u64;
     let mut disconnected_at = None;
+    // Registered once, before the reconnect loop, so no signal falls between connections.
+    let mut sigterm = signal(SignalKind::terminate())?;
     let mut detector = analysis::SignalDetector::new(cfg);
     let active_rules = load_fresh_ruleset(&root, cfg)
         .and_then(|set| qualified_rule_results(&set))
@@ -193,7 +197,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                 tokio::pin!(stall_deadline);
                 loop {
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => { flush(&root, &mut ts, &mut bs, &mut ss)?; return Ok(()); }
+                        _ = shutdown_requested(&mut sigterm) => { flush(&root, &mut ts, &mut bs, &mut ss)?; return Ok(()); }
                         maintenance = next_maintenance(&mut flush_ticker, stall_deadline.as_mut()) => match maintenance {
                             Maintenance::Flush => {
                                 flush(&root, &mut ts, &mut bs, &mut ss)?;
@@ -226,8 +230,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                         let new = detector.on_trade(&t);
                                         retain_and_emit_alerts(&root, &mut alert_sink, &new, &mut ss)?;
                                     }
-                                    let should_flush = ts.len() >= 100;
-                                    if should_flush { flush(&root, &mut ts, &mut bs, &mut ss)?; }
+                                    if ts.len() >= MAX_BUFFERED_RECORDS { flush(&root, &mut ts, &mut bs, &mut ss)?; }
                                     Ok(())
                                 })();
                                 if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
@@ -238,7 +241,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                                 let handled: Result<()> = (|| {
                                     let new = detector.on_orderbook(&b);
                                     retain_and_emit_alerts(&root, &mut alert_sink, &new, &mut ss)?;
-                                    if bs.len() >= 100 { flush(&root, &mut ts, &mut bs, &mut ss)?; }
+                                    if bs.len() >= MAX_BUFFERED_RECORDS { flush(&root, &mut ts, &mut bs, &mut ss)?; }
                                     Ok(())
                                 })();
                                 if let Err(error) = handled { flush(&root, &mut ts, &mut bs, &mut ss)?; return Err(error); }
@@ -287,6 +290,23 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
             }],
         )?;
         delay = (delay * 2).min(60);
+    }
+}
+
+/// Memory backstop only. Normal flushing is the `flush_interval_seconds` ticker; this
+/// exists so a starved ticker cannot grow a buffer without bound.
+const MAX_BUFFERED_RECORDS: usize = 50_000;
+
+/// Completes on Ctrl-C or SIGTERM.
+///
+/// Both have to flush. `systemd`, `launchd`, Docker and `timeout` all stop a process with
+/// SIGTERM rather than SIGINT, and the buffer in front of the writer holds up to
+/// `flush_interval_seconds` of collection — silently discarding that on every managed
+/// restart puts gaps in the very window the validation gate depends on.
+async fn shutdown_requested(sigterm: &mut UnixSignal) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
     }
 }
 
@@ -560,14 +580,31 @@ where
 fn analyze(cfg: &Config) -> Result<()> {
     cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
-    let t = storage::read_all(&root, "trades")?;
-    let b = storage::read_all(&root, "orderbooks")?;
-    let orderbook_dates: BTreeSet<_> = b
-        .iter()
-        .map(|book: &rustle::model::Orderbook| book.meta.exchange_ts.date_naive())
+    // Orderbooks are the bulk of the archive — ~157M records over a 28-day window at the
+    // measured rate — and nothing after signal building reads them again. So they are read
+    // one UTC partition at a time and dropped, while trades accumulate: outcome matching and
+    // validation both need the whole trade series. The detector is deliberately created once
+    // and held across every chunk; see `analysis::feed_signals`.
+    let mut dates: BTreeSet<NaiveDate> = storage::dataset_dates(&root, "trades")?
+        .into_iter()
         .collect();
-    let s = analysis::build_signals(&t, &b, cfg);
-    drop(b);
+    dates.extend(storage::dataset_dates(&root, "orderbooks")?);
+    let mut detector = analysis::SignalDetector::new(cfg);
+    let mut t: Vec<rustle::model::Trade> = vec![];
+    let mut s: Vec<Signal> = vec![];
+    let mut orderbook_dates: BTreeSet<NaiveDate> = BTreeSet::new();
+    for date in dates {
+        let day_trades: Vec<rustle::model::Trade> = storage::read_date(&root, "trades", date)?;
+        let day_books: Vec<rustle::model::Orderbook> =
+            storage::read_date(&root, "orderbooks", date)?;
+        orderbook_dates.extend(day_books.iter().map(|b| b.meta.exchange_ts.date_naive()));
+        s.extend(analysis::feed_signals(
+            &mut detector,
+            &day_trades,
+            &day_books,
+        ));
+        t.extend(day_trades);
+    }
     // Signals are derived artefacts. Replace them so a repeated analyze is deterministic.
     storage::clear_dataset(&root, "signals")?;
     let audit = analysis::evaluate_with_audit(&s, &t, &orderbook_dates, cfg)?;
@@ -685,9 +722,14 @@ fn coverage(cfg: &Config, csv: bool) -> Result<()> {
         }
         println!();
     }
+    let (bytes, file_count) = storage::footprint(&root)?;
+    let observed_seconds = analysis::observed_collection_seconds(&trades, &books);
     let summary = format!(
-        "{} of {} required contiguous UTC dates present",
-        status.present_count, status.required
+        "{} of {} required contiguous UTC dates present\n{}",
+        status.present_count,
+        status.required,
+        analysis::render_footprint_projection(bytes, file_count, observed_seconds, status.required)
+            .trim_end(),
     );
     if csv {
         eprintln!("{summary}");
@@ -1110,6 +1152,45 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].state, "stalled");
         assert_eq!(events[0].detail, "no frame within stall timeout");
+    }
+
+    #[test]
+    fn buffer_backstop_sits_far_above_one_flush_interval_of_observed_traffic() {
+        // Measured 2026-08-26: 7,516 orderbooks in 116s across 20 markets = ~65/s.
+        // The backstop exists to bound memory if the flush ticker is starved, not to
+        // drive normal flushing — if it trips on ordinary traffic we are back to
+        // writing a file per market every few seconds.
+        let per_interval = 65 * Config::default().flush_interval_seconds as usize;
+        assert!(
+            MAX_BUFFERED_RECORDS > per_interval * 2,
+            "backstop {MAX_BUFFERED_RECORDS} must clear {per_interval} buffered records with margin"
+        );
+    }
+
+    #[test]
+    fn one_flush_writes_one_file_per_market_day_regardless_of_record_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trades: Vec<Trade> = (0..600)
+            .map(|i| {
+                let mut m = meta(0);
+                m.market = if i % 2 == 0 { "KRW-A" } else { "KRW-B" }.into();
+                Trade {
+                    meta: m,
+                    price: 10.,
+                    volume: 1.,
+                    side: Side::Buy,
+                    sequential_id: None,
+                }
+            })
+            .collect();
+
+        flush(dir.path(), &mut trades, &mut vec![], &mut vec![]).unwrap();
+
+        let files = std::fs::read_dir(dir.path().join("trades/date=2025-01-01"))
+            .unwrap()
+            .flat_map(|market| std::fs::read_dir(market.unwrap().path()).unwrap())
+            .count();
+        assert_eq!(files, 2, "600 records across 2 markets is 2 files, not 12");
     }
 
     #[test]
