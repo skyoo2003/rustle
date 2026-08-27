@@ -69,10 +69,12 @@ across a 20-market universe, or ~500K files over the full window. Parquet is wri
 which is worth about 34x on this data — a JSON payload column with a repeated field-name skeleton.
 Budget tens of GB, not hundreds. Both numbers scale with `top_market_count`.
 
-There is a five-minute buffer in front of that. Ctrl-C, a stall, a disconnect, and any write error
-all flush first, so the exposure is one `flush_interval_seconds` window on an *ungraceful* death
-only — SIGKILL, panic, power loss. Lower `flush_interval_seconds` if you would rather trade files
-for durability; the cost is roughly linear.
+There is a five-minute buffer in front of that. Ctrl-C (SIGINT), **SIGTERM**, a stall, a disconnect,
+and any write error all flush first, so the exposure is one `flush_interval_seconds` window only on
+a death that runs no code at all — SIGKILL, panic, power loss. SIGTERM matters because that is how
+`systemd`, `launchd`, Docker and `timeout` stop a service: a managed restart flushes rather than
+discarding the buffer. Lower `flush_interval_seconds` if you would rather trade files for
+durability; the cost is roughly linear.
 
 Run `coverage` periodically (or `coverage --csv`) to inspect daily counts, markets, disconnects,
 stalls, connection gaps, and progress toward the required 28 contiguous UTC dates. It ends with a

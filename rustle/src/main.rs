@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+// Aliased: `Signal` is already the detector's output type in this file.
+use tokio::signal::unix::{signal, Signal as UnixSignal, SignalKind};
 
 #[derive(Parser)]
 #[command(
@@ -108,6 +110,8 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
     );
     let mut delay = 1u64;
     let mut disconnected_at = None;
+    // Registered once, before the reconnect loop, so no signal falls between connections.
+    let mut sigterm = signal(SignalKind::terminate())?;
     let mut detector = analysis::SignalDetector::new(cfg);
     let active_rules = load_fresh_ruleset(&root, cfg)
         .and_then(|set| qualified_rule_results(&set))
@@ -193,7 +197,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                 tokio::pin!(stall_deadline);
                 loop {
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => { flush(&root, &mut ts, &mut bs, &mut ss)?; return Ok(()); }
+                        _ = shutdown_requested(&mut sigterm) => { flush(&root, &mut ts, &mut bs, &mut ss)?; return Ok(()); }
                         maintenance = next_maintenance(&mut flush_ticker, stall_deadline.as_mut()) => match maintenance {
                             Maintenance::Flush => {
                                 flush(&root, &mut ts, &mut bs, &mut ss)?;
@@ -292,6 +296,19 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
 /// Memory backstop only. Normal flushing is the `flush_interval_seconds` ticker; this
 /// exists so a starved ticker cannot grow a buffer without bound.
 const MAX_BUFFERED_RECORDS: usize = 50_000;
+
+/// Completes on Ctrl-C or SIGTERM.
+///
+/// Both have to flush. `systemd`, `launchd`, Docker and `timeout` all stop a process with
+/// SIGTERM rather than SIGINT, and the buffer in front of the writer holds up to
+/// `flush_interval_seconds` of collection — silently discarding that on every managed
+/// restart puts gaps in the very window the validation gate depends on.
+async fn shutdown_requested(sigterm: &mut UnixSignal) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Maintenance {
