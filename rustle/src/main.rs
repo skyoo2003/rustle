@@ -90,6 +90,10 @@ async fn main() -> Result<()> {
 async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
     cfg.validate_collection_intervals()?;
     let root = PathBuf::from(&cfg.data_root);
+    let started = std::time::Instant::now();
+    let mut received_trades = 0u64;
+    let mut received_books = 0u64;
+    eprintln!("collect: fetching top {} KRW markets", cfg.top_market_count);
     let mut markets = upbit::top_krw_markets(cfg.top_market_count).await?;
     let now = Utc::now();
     let mut universe_day = now.date_naive();
@@ -170,6 +174,10 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                 gap_ms: None,
             }],
         )?;
+        eprintln!(
+            "collect: connecting to websocket ({} markets)",
+            markets.len()
+        );
         match upbit::connect(&markets).await {
             Ok(mut ws) => {
                 delay = 1;
@@ -184,6 +192,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                     "websocket connected; rolling and sequence state reset",
                     gap,
                 )?;
+                eprintln!("collect: connected; progress every 10s (counts since startup)");
                 let mut ts = Vec::new();
                 let mut bs = Vec::new();
                 let mut ss = Vec::new();
@@ -193,11 +202,23 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                     tokio::time::Instant::now() + flush_period,
                     flush_period,
                 );
+                let mut progress_ticker = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                    Duration::from_secs(10),
+                );
+                progress_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let stall_deadline = tokio::time::sleep(stall_period);
                 tokio::pin!(stall_deadline);
                 loop {
                     tokio::select! {
-                        _ = shutdown_requested(&mut sigterm) => { flush(&root, &mut ts, &mut bs, &mut ss)?; return Ok(()); }
+                        _ = shutdown_requested(&mut sigterm) => { flush(&root, &mut ts, &mut bs, &mut ss)?; eprintln!("collect: stopped after {}s; trades={} orderbooks={}; buffers flushed", started.elapsed().as_secs(), received_trades, received_books); return Ok(()); }
+                        _ = progress_ticker.tick() => {
+                            eprintln!(
+                                "collect: elapsed={}s markets={} trades={} orderbooks={} buffered(trades/orderbooks/signals)={}/{}/{}",
+                                started.elapsed().as_secs(), markets.len(), received_trades,
+                                received_books, ts.len(), bs.len(), ss.len(),
+                            );
+                        }
                         maintenance = next_maintenance(&mut flush_ticker, stall_deadline.as_mut()) => match maintenance {
                             Maintenance::Flush => {
                                 flush(&root, &mut ts, &mut bs, &mut ss)?;
@@ -224,6 +245,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                             Ok(Some(Incoming::Trade(t))) => {
                                 stall_deadline.as_mut().reset(tokio::time::Instant::now() + stall_period);
                                 // Raw capture is authoritative: sequence checks only suppress detector state.
+                                received_trades += 1;
                                 ts.push(t.clone());
                                 let handled: Result<()> = (|| {
                                     if sequence_ok(&mut sequences, &t, &root)? {
@@ -237,6 +259,7 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
                             }
                             Ok(Some(Incoming::Orderbook(b))) => {
                                 stall_deadline.as_mut().reset(tokio::time::Instant::now() + stall_period);
+                                received_books += 1;
                                 bs.push(b.clone());
                                 let handled: Result<()> = (|| {
                                     let new = detector.on_orderbook(&b);
@@ -267,8 +290,15 @@ async fn collect(cfg: &Config, once: bool, emit_alerts: bool) -> Result<()> {
             }
         };
         if once {
+            eprintln!(
+                "collect: stopped after {}s; trades={} orderbooks={}",
+                started.elapsed().as_secs(),
+                received_trades,
+                received_books
+            );
             return Ok(());
         }
+        eprintln!("collect: reconnecting in {delay}s");
         let start = Utc::now();
         tokio::time::sleep(Duration::from_secs(delay)).await;
         let meta = Meta {
@@ -541,11 +571,18 @@ fn flush(
     books: &mut Vec<rustle::model::Orderbook>,
     signals: &mut Vec<rustle::model::Signal>,
 ) -> Result<()> {
+    let counts = (trades.len(), books.len(), signals.len());
     write_partitioned(root, "trades", trades.drain(..), |trade| &trade.meta)?;
     write_partitioned(root, "orderbooks", books.drain(..), |book| &book.meta)?;
     write_partitioned(root, "live_signals", signals.drain(..), |signal| {
         &signal.meta
     })?;
+    if counts != (0, 0, 0) {
+        eprintln!(
+            "collect: saved trades={} orderbooks={} signals={}",
+            counts.0, counts.1, counts.2
+        );
+    }
     Ok(())
 }
 
