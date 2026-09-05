@@ -56,6 +56,11 @@ cargo run -p rustle -- paper   --config rustle.toml
 
 Requires a recent stable Rust toolchain (edition 2021).
 
+During `collect`, stderr shows connection/retry status and progress every 10 seconds:
+elapsed time, current market count, trades and orderbooks received since startup, and buffered
+trade/orderbook/signal counts. Successful writes print saved batch counts; graceful shutdown
+prints final receive totals after flushing. Progress stays separate from alert output on stdout.
+
 Collection flushes buffered trades, orderbooks, and live signals every
 `flush_interval_seconds` (300 seconds by default). If no WebSocket frame arrives within
 `stall_timeout_seconds` (90 seconds by default), Rustle flushes the buffers, records a `stalled`
